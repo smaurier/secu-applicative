@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiz 08 — Sécurité des APIs</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;padding:2rem 1rem}.container{max-width:800px;margin:0 auto}h1{text-align:center;margin-bottom:.5rem;font-size:1.8rem;color:#fff}.subtitle{text-align:center;color:#8892b0;margin-bottom:2rem;font-size:1rem}.progress-bar-container{background:#0d1117;border-radius:10px;height:14px;margin-bottom:2rem;overflow:hidden}.progress-bar{background:linear-gradient(90deg,#0d6efd,#4dabf7);height:100%;width:0%;border-radius:10px;transition:width .4s}.progress-text{text-align:center;color:#8892b0;margin-bottom:1rem;font-size:.9rem}.card{background:#16213e;border-radius:12px;padding:2rem;margin-bottom:1.5rem;box-shadow:0 4px 20px rgba(0,0,0,.3)}.question-label{font-size:.85rem;color:#4dabf7;text-transform:uppercase;letter-spacing:1px;margin-bottom:.5rem}.question-text{font-size:1.15rem;margin-bottom:1.2rem;line-height:1.5;color:#fff}pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-bottom:1.2rem;overflow-x:auto;font-size:.95rem}code{font-family:'Consolas','Fira Code','Courier New',monospace;color:#c9d1d9}.options{list-style:none}.options li{margin-bottom:.5rem}.options label{display:flex;align-items:center;gap:.75rem;padding:.8rem 1rem;background:#0d1117;border:2px solid #30363d;border-radius:8px;cursor:pointer;transition:border-color .2s,background .2s;font-size:1rem}.options label:hover{border-color:#4dabf7;background:#1c2a4a}.options input[type="radio"]{accent-color:#0d6efd;width:18px;height:18px;flex-shrink:0}.btn{display:inline-block;padding:.7rem 2rem;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s,transform .1s}.btn-primary{background:#0d6efd;color:#fff}.btn-primary:hover{background:#3b82f6}.btn-primary:disabled{background:#374151;cursor:not-allowed}.btn-restart{background:#238636;color:#fff;margin-top:1rem;padding:.7rem 2rem;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer}.btn-restart:hover{background:#2ea043}.feedback{margin-top:1rem;padding:1rem 1.2rem;border-radius:8px;font-size:.95rem;line-height:1.5;display:none}.feedback.correct{background:#0f5132;border:1px solid #198754;color:#d1fae5;display:block}.feedback.wrong{background:#842029;border:1px solid #dc3545;color:#fdd;display:block}.score-card{text-align:center;padding:3rem 2rem}.score-card .score{font-size:3rem;font-weight:700;color:#4dabf7;margin-bottom:.5rem}.score-card .score-label{font-size:1.2rem;color:#8892b0;margin-bottom:1.5rem}.hidden{display:none}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Quiz 08 — Sécurité des APIs</h1>
+    <p class="subtitle">Rate limiting, validation, GraphQL et bonnes pratiques API</p>
+    <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="progress-text" id="progressText">Question 1 / 5</p>
+    <div id="quizContainer"></div>
+    <div id="scoreContainer" class="card score-card hidden"></div>
+  </div>
+  <script>
+    const questions = [
+      {
+        label: "Question 1 — Rate Limiting",
+        text: "Quel code HTTP doit être retourné quand un client dépasse la limite de requêtes ?",
+        options: [
+          "401 Unauthorized",
+          "403 Forbidden",
+          "429 Too Many Requests",
+          "503 Service Unavailable"
+        ],
+        answer: 2,
+        explanation: "Le code 429 (Too Many Requests) indique spécifiquement que le client a envoyé trop de requêtes dans un laps de temps donné. Il est souvent accompagné d'un en-tête <code>Retry-After</code>."
+      },
+      {
+        label: "Question 2 — Validation d'entrée",
+        text: "Où doit-on valider les entrées utilisateur dans une API REST ?",
+        options: [
+          "Uniquement côté client (le serveur fait confiance au frontend)",
+          "Uniquement côté serveur (le client peut être contourné)",
+          "Côté client ET côté serveur (defense in depth)",
+          "Dans le middleware de rate limiting"
+        ],
+        answer: 2,
+        explanation: "La validation côté client améliore l'UX mais peut être contournée. La validation côté serveur est OBLIGATOIRE car c'est la seule qu'un attaquant ne peut pas contourner. Les deux ensemble offrent la meilleure protection."
+      },
+      {
+        label: "Question 3 — GraphQL Security",
+        text: "Quelle attaque spécifique aux APIs GraphQL consiste à créer des requêtes profondément imbriquées ?",
+        code: "query {\n  user(id: 1) {\n    friends {\n      friends {\n        friends {\n          friends { ... }\n        }\n      }\n    }\n  }\n}",
+        options: [
+          "SQL Injection",
+          "Depth Attack (requête profondément imbriquée causant un DoS)",
+          "Schema Introspection",
+          "Batch Attack"
+        ],
+        answer: 1,
+        explanation: "Les GraphQL Depth Attacks exploitent les relations récursives pour créer des requêtes exponentielles en coût. Solution : limiter la profondeur maximale (ex: 10 niveaux), limiter la complexité des requêtes, et désactiver l'introspection en production."
+      },
+      {
+        label: "Question 4 — Idempotency",
+        text: "Pourquoi utilise-t-on des clés d'idempotence dans les API de paiement ?",
+        code: "POST /api/payments\nIdempotency-Key: abc-123-def\n\n{ \"amount\": 50, \"currency\": \"EUR\" }",
+        options: [
+          "Pour chiffrer le montant du paiement",
+          "Pour garantir qu'une même requête rejouée ne crée pas de doublon (ex: double débit)",
+          "Pour authentifier le client auprès du processeur de paiement",
+          "Pour accélérer le traitement des paiements"
+        ],
+        answer: 1,
+        explanation: "L'idempotence garantit qu'une requête rejouée (timeout réseau, retry) produit le même résultat. Le serveur stocke la clé et retourne la même réponse si la requête est rejouée, évitant les double-débits."
+      },
+      {
+        label: "Question 5 — API Key vs Token",
+        text: "Quelle est la différence entre une API Key et un token JWT pour l'authentification ?",
+        options: [
+          "Ils sont interchangeables et offrent la même sécurité",
+          "Une API Key identifie l'application, un JWT authentifie un utilisateur spécifique avec des claims",
+          "Les API Keys sont plus sécurisées car elles ne contiennent pas de données",
+          "Les JWT sont uniquement utilisés pour les applications mobiles"
+        ],
+        answer: 1,
+        explanation: "L'API Key identifie le client/application (quoi), tandis que le JWT contient l'identité de l'utilisateur (qui) avec des claims (permissions, expiration). En pratique, on utilise souvent les deux : API Key pour identifier l'app + JWT pour l'utilisateur."
+      }
+    ];
+
+    let current=0,score=0,answered=false;const container=document.getElementById('quizContainer'),scoreContainer=document.getElementById('scoreContainer'),progressBar=document.getElementById('progressBar'),progressText=document.getElementById('progressText');function render(){if(current>=questions.length)return showScore();const q=questions[current];progressBar.style.width=((current/questions.length)*100)+'%';progressText.textContent=`Question ${current+1} / ${questions.length}`;answered=false;let html=`<div class="card"><p class="question-label">${q.label}</p><p class="question-text">${q.text}</p>`;if(q.code)html+=`<pre><code>${q.code}</code></pre>`;html+=`<ul class="options">`;q.options.forEach((opt,i)=>{html+=`<li><label><input type="radio" name="q" value="${i}"><span>${opt}</span></label></li>`;});html+=`</ul><button class="btn btn-primary" id="submitBtn" disabled onclick="checkAnswer()">Valider</button><div id="feedback" class="feedback"></div></div>`;container.innerHTML=html;document.querySelectorAll('input[name="q"]').forEach(input=>{input.addEventListener('change',()=>{if(!answered)document.getElementById('submitBtn').disabled=false;});});}function checkAnswer(){if(answered)return;answered=true;const selected=document.querySelector('input[name="q"]:checked');if(!selected)return;const idx=parseInt(selected.value),q=questions[current],feedback=document.getElementById('feedback');if(idx===q.answer){score++;feedback.className='feedback correct';feedback.innerHTML=`✅ Correct ! ${q.explanation}`;}else{feedback.className='feedback wrong';feedback.innerHTML=`❌ Incorrect. ${q.explanation}`;}document.getElementById('submitBtn').textContent='Suivant →';document.getElementById('submitBtn').onclick=()=>{current++;render();};}function showScore(){progressBar.style.width='100%';progressText.textContent='Terminé !';container.innerHTML='';const pct=Math.round((score/questions.length)*100);let msg=pct===100?'🏆 Parfait !':pct>=60?'👍 Bien joué !':'📚 À revoir';scoreContainer.innerHTML=`<div class="score">${score}/${questions.length}</div><div class="score-label">${pct}% — ${msg}</div><button class="btn-restart" onclick="location.reload()">🔄 Recommencer</button>`;scoreContainer.classList.remove('hidden');}render();
+  </script>
+</body>
+</html>
