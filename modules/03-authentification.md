@@ -1,652 +1,387 @@
-# Module 3 — Authentification
-
-## Objectifs pédagogiques
-
-- Distinguer authentification et autorisation
-- Maîtriser le hashing sécurisé des mots de passe
-- Comprendre les sessions vs tokens (JWT)
-- Implémenter OAuth2/OIDC et MFA
-- Prévenir les attaques sur les sessions
-
+---
+titre: Authentification — hachage, sessions, MFA, durcissement
+cours: 14-securite-applicative
+notions: ["sessions vs tokens", "hachage argon2id / bcrypt", "jamais MD5/SHA seul", "politique de mot de passe (OWASP)", "MFA / TOTP", "gestion de session sécurisée", "protection brute-force", "reset password sûr", "user enumeration"]
+outcomes:
+  - "sait hacher un mot de passe avec argon2id (ou bcrypt) aux paramètres OWASP 2026 et expliquer pourquoi MD5/SHA seul est disqualifié"
+  - "sait choisir entre session serveur et token, et durcir chaque option (cookie __Host-, régénération, timeouts)"
+  - "sait appliquer une politique de mot de passe OWASP (longueur, pas de rotation, blocage des mots de passe compromis)"
+  - "sait ajouter un second facteur TOTP et durcir un flux d'auth contre le brute-force et l'énumération d'utilisateurs"
+  - "sait concevoir un reset password sûr (token aléatoire à durée de vie courte, message générique)"
+prerequis:
+  - "Introduction sécurité — modèle de menace, CIA, defense in depth (module 00)"
+  - "OWASP Top 10 2021 — A07 Identification and Authentication Failures (module 01)"
+  - "Injection & échappement — requêtes paramétrées, validation d'entrée (module 02)"
+next: 03b-oidc-pkce-client
+libs: []
+tribuzen: back-office TribuZen — authentification des parents/familles (login, hachage, session, MFA, reset)
+last-reviewed: 2026-07
 ---
 
-## 1. Authentification vs Autorisation
+<!-- FLAG-REVIEW: SÉCURITÉ — à valider par Sylvain -->
 
-| | Authentification | Autorisation |
-|---|---|---|
-| **Question** | *Qui es-tu ?* | *Qu'as-tu le droit de faire ?* |
-| **Moment** | Avant l'autorisation | Après l'authentification |
-| **Mécanisme** | Mot de passe, MFA, biométrie | Rôles, permissions, ACL |
-| **Erreur HTTP** | 401 Unauthorized | 403 Forbidden |
-| **Exemple** | Login avec email/password | Accéder au panneau admin |
+# Authentification — hachage, sessions, MFA, durcissement
+
+> **Outcomes — tu sauras FAIRE :** hacher un mot de passe aux paramètres OWASP 2026, choisir et durcir une stratégie de session/token, appliquer une politique de mot de passe moderne, ajouter un second facteur TOTP, et fermer les portes du brute-force, de l'énumération d'utilisateurs et d'un reset password fragile.
+> **Difficulté :** :star::star::star:
+>
+> **Angle : DÉFENSIF.** On montre les failles pour les **comprendre et les corriger** dans TON code, jamais pour attaquer un tiers.
+>
+> **Portée :** ce module couvre l'**authentification classique par mot de passe** (le facteur « ce que tu sais ») plus le second facteur TOTP. La délégation d'identité **OAuth2 / OIDC + PKCE** est le **module 03b**. **WebAuthn / passkeys** (le facteur « ce que tu possèdes », sans mot de passe) est le **module 03c**. L'**autorisation** (« qu'as-tu le droit de faire ? ») est le **module 04** — ici on répond seulement à « qui es-tu ? ».
+
+## 1. Cas concret d'abord
+
+Tu reprends le back-office TribuZen. Un parent se connecte pour gérer les activités de ses enfants — donc des **données de mineurs**, l'enjeu le plus sensible de l'app. Un collègue a livré ce endpoint de login. Il « marche » en démo.
 
 ```typescript
-// Middleware Express — deux étapes distinctes
-async function authenticate(req: Request, res: Response, next: NextFunction) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Non authentifié' });
+// POST /api/login — AVANT durcissement. NE PAS copier en prod.
+import crypto from 'node:crypto'
 
-  try {
-    req.user = verifyToken(token);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Token invalide' });
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body
+
+  const user = await db.user.findUnique({ where: { email } })
+  if (!user) {
+    return res.status(404).json({ error: `Aucun compte pour ${email}` }) // (1)
   }
-}
 
-function authorize(...roles: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Accès interdit' });
-    }
-    next();
-  };
-}
+  // (2) SHA-256 « parce que c'est cryptographique »
+  const hash = crypto.createHash('sha256').update(password).digest('hex')
+  if (hash !== user.passwordHash) {
+    return res.status(401).json({ error: 'Mot de passe incorrect' })      // (3)
+  }
 
-// Utilisation
-app.delete('/api/users/:id', authenticate, authorize('admin'), deleteUser);
+  // (4) le serveur renvoie l'id utilisateur en clair comme « jeton »
+  res.json({ token: user.id })
+})
 ```
+
+**Quatre trous que ce module va boucher :**
+
+1. **Énumération d'utilisateurs** — `404 « Aucun compte pour X »` dit à un attaquant quels emails existent. Message + code HTTP doivent être **identiques** que le compte existe ou non.
+2. **Hachage disqualifié** — `SHA-256` est un hash *rapide* : un GPU teste des milliards de candidats par seconde. Pour un mot de passe il faut un hash *lent et paramétrable* (argon2id, bcrypt). Et il n'y a **pas de sel**, donc deux parents avec le même mot de passe ont le même hash.
+3. **Aucune limite de tentatives** — rien n'empêche 10 000 essais/seconde sur un compte.
+4. **« Jeton » = id en clair** — devinable, non signé, non expirable, non révocable. Ce n'est pas de l'authentification.
+
+À la fin du module, ce endpoint hache en argon2id, renvoie un message générique en temps constant, limite le brute-force, pose un cookie de session `__Host-`, et propose un second facteur. C'est le fil rouge du lab.
 
 ---
 
-## 2. Mots de passe sécurisés
+## 2. Théorie complète, concise
 
-### 2.1 Pourquoi le hashing est essentiel
+### 2.1 Authentification ≠ autorisation (cadrage)
 
-| Méthode | Sécurité | Temps de crack |
+- **Authentification (authN)** — « qui es-tu ? ». Échec → **401**.
+- **Autorisation (authZ)** — « as-tu le droit ? ». Échec → **403**.
+
+Ce module ne traite que l'authN. L'authZ (rôles, RBAC, IDOR) est le module 04. Les confondre est une cause classique de faille.
+
+### 2.2 Hacher un mot de passe : lent, salé, paramétrable
+
+Un mot de passe ne se **chiffre jamais** (le chiffrement est réversible) : on le **hache** avec une fonction conçue pour être **lente et gourmande en mémoire**, de sorte qu'une fuite de base ne permette pas de retrouver les mots de passe par force brute.
+
+**Disqualifiés pour un mot de passe :** MD5, SHA-1, SHA-256, SHA-512 **seuls**. Ce sont des hash *rapides* — parfaits pour l'intégrité d'un fichier, catastrophiques pour un mot de passe. OWASP : « les algorithmes de hachage rapides comme SHA-256 ne conviennent pas au stockage de mots de passe car ils permettent à un attaquant un très grand nombre d'essais rapidement ».
+
+**Recommandations OWASP (Password Storage Cheat Sheet, vérifié 2026-07) :**
+
+| Algorithme | Quand | Paramètres minimaux OWASP |
 |---|---|---|
-| Texte clair | ❌ Catastrophique | Instantané |
-| MD5 | ❌ Cassé | Secondes |
-| SHA-256 (sans sel) | ❌ Insuffisant | Minutes (rainbow tables) |
-| bcrypt | ✅ Bon | Années |
-| argon2id | ✅ Excellent | Années+ |
+| **argon2id** | 1er choix | mémoire **≥ 19 MiB**, itérations **2**, parallélisme **1** |
+| **scrypt** | si argon2 indisponible | coût CPU/mémoire `N = 2^17`, `r = 8`, `p = 1` |
+| **bcrypt** | legacy / systèmes anciens | facteur de travail (cost) **≥ 10** ; **limite d'entrée 72 octets** |
+| **PBKDF2** | contrainte FIPS-140 | PBKDF2-HMAC-SHA256 **600 000** itérations |
 
-### 2.2 Hashing avec bcrypt
-
-```typescript
-import bcrypt from 'bcrypt';
-
-const SALT_ROUNDS = 12; // Coût exponentiel (2^12 itérations)
-
-// Créer un hash
-async function hashPassword(password: string): Promise<string> {
-  return bcrypt.hash(password, SALT_ROUNDS);
-  // Résultat : $2b$12$LJ3m4ys3Lg.Y/7gBSGKjGO...
-  //            ↑   ↑  ↑
-  //          algo cost  salt+hash
-}
-
-// Vérifier un mot de passe
-async function verifyPassword(password: string, hash: string): Promise<boolean> {
-  return bcrypt.compare(password, hash);
-}
-```
-
-### 2.3 Hashing avec argon2 (recommandé)
+> Ce sont des **planchers**. Sur un serveur moderne, on monte les paramètres tant que le hachage reste ~raisonnable (viser un login sous ~1 s). Argon2id à 19 MiB est un minimum ; 64 MiB est courant.
 
 ```typescript
-import { hash, verify, argon2id } from 'argon2';
+// argon2id — 1er choix (paquet: argon2)
+import argon2 from 'argon2'
 
-async function hashPassword(password: string): Promise<string> {
-  return hash(password, {
-    type: argon2id,     // Résistant aux attaques GPU et side-channel
-    memoryCost: 65536,  // 64 MB de RAM
-    timeCost: 3,        // 3 itérations
-    parallelism: 4,     // 4 threads
-  });
+async function hashPassword(plain: string): Promise<string> {
+  return argon2.hash(plain, {
+    type: argon2.argon2id,  // hybride : résiste GPU (data-dependent) ET side-channel
+    memoryCost: 19456,      // 19 MiB, en KiB — plancher OWASP ; monter si le serveur suit
+    timeCost: 2,            // itérations
+    parallelism: 1,
+  })
+  // argon2 GÉNÈRE et EMBARQUE le sel + les paramètres dans la chaîne renvoyée :
+  //   $argon2id$v=19$m=19456,t=2,p=1$<sel base64>$<hash base64>
 }
 
-async function verifyPassword(hash: string, password: string): Promise<boolean> {
-  return verify(hash, password);
+async function verifyPassword(hashed: string, plain: string): Promise<boolean> {
+  // Comparaison en temps constant, fournie par la lib. Ne JAMAIS comparer avec ===.
+  return argon2.verify(hashed, plain)
 }
-```
-
-### 2.4 Salt et Pepper
-
-```
-Salt  = valeur aléatoire UNIQUE par mot de passe (stockée avec le hash)
-        → Empêche les rainbow tables et le crack en parallèle
-
-Pepper = valeur secrète GLOBALE (stockée en dehors de la BDD)
-         → Protège même si la BDD est compromise
 ```
 
 ```typescript
-// bcrypt et argon2 gèrent le salt automatiquement
-// Le pepper est un secret applicatif supplémentaire
+// bcrypt — alternative si argon2 indisponible (paquet: bcrypt)
+import bcrypt from 'bcrypt'
 
-const PEPPER = process.env.PASSWORD_PEPPER!; // Secret hors BDD
+const COST = 12 // ≥ 10 (OWASP) ; 12 est un bon défaut 2026
 
-async function hashWithPepper(password: string): Promise<string> {
-  return hash(password + PEPPER);
+async function hashPassword(plain: string): Promise<string> {
+  // ⚠️ bcrypt IGNORE au-delà de 72 octets. Pré-hacher en SHA-256 base64
+  //    AVANT bcrypt si tu veux accepter les longs passphrases sans troncature silencieuse.
+  return bcrypt.hash(plain, COST) // sel généré et embarqué : $2b$12$...
 }
 ```
 
-### 2.5 Politique de mots de passe
+**Sel vs poivre (pepper) :**
+- **Sel (salt)** — aléatoire, **unique par mot de passe**, stocké *avec* le hash. argon2/bcrypt le gèrent seuls. Il casse les rainbow tables et empêche de cracker deux comptes identiques d'un coup.
+- **Poivre (pepper)** — secret **global**, stocké *hors* de la base (variable d'env, KMS). Optionnel, en défense en profondeur : si seule la base fuit, les hash restent inattaquables sans le poivre. Implémenté idéalement via un HMAC de la lib, pas par simple concaténation.
+
+### 2.3 Politique de mot de passe : ce qui a changé
+
+Les règles « 8 caractères, 1 majuscule, 1 chiffre, 1 symbole, changement tous les 90 jours » sont **obsolètes** (elles poussent aux `Password1!` et aux post-it). Politique OWASP / NIST actuelle :
+
+- **Longueur** : minimum **8** si MFA activé, **15** sans MFA. Maximum **≥ 64** pour autoriser les passphrases.
+- **Composition** : **autoriser tous les caractères** (unicode, espaces inclus). Pas d'obligation de classes de caractères.
+- **Pas de troncature silencieuse** au-delà du max.
+- **Bloquer les mots de passe compromis** — vérifier contre une base de fuites (Pwned Passwords, via **k-anonymity** : on n'envoie que les 5 premiers caractères du SHA-1). Optionnel : mètre de robustesse (zxcvbn).
+- **Pas de rotation périodique** imposée — on ne force le changement qu'en cas de compromission avérée.
+- **MFA** = la meilleure défense (stoppe ~99,9 % des compromissions de compte selon les analyses citées par OWASP).
+
+### 2.4 Sessions vs tokens
+
+Après vérification du mot de passe, il faut **maintenir** l'identité entre les requêtes (HTTP est sans état). Deux familles :
+
+**Session serveur (stateful)** — le serveur génère un **identifiant de session opaque et aléatoire**, le stocke (Redis/BDD), et le renvoie dans un **cookie**. À chaque requête il fait un lookup.
 
 ```typescript
-import { z } from 'zod';
-
-const PasswordSchema = z.string()
-  .min(12, 'Minimum 12 caractères')
-  .max(128, 'Maximum 128 caractères')
-  .refine(
-    (pw) => /[a-z]/.test(pw) && /[A-Z]/.test(pw) && /[0-9]/.test(pw),
-    'Doit contenir minuscules, majuscules et chiffres'
-  );
-
-// Vérifier contre les mots de passe compromis (Have I Been Pwned)
-async function isPasswordBreached(password: string): Promise<boolean> {
-  const hash = crypto.createHash('sha1').update(password).digest('hex').toUpperCase();
-  const prefix = hash.slice(0, 5);
-  const suffix = hash.slice(5);
-
-  const res = await fetch(`https://api.pwnedpasswords.com/range/${prefix}`);
-  const text = await res.text();
-  return text.includes(suffix);
-}
-```
-
----
-
-## 3. Sessions vs Tokens
-
-### 3.1 Authentification par session
-
-```
-Client                    Serveur
-  │                          │
-  ├── POST /login ──────────►│
-  │   {email, password}      │
-  │                          ├── Vérifie credentials
-  │                          ├── Crée session en BDD/mémoire
-  │◄── Set-Cookie: sid=abc ──┤
-  │                          │
-  ├── GET /api/me ──────────►│
-  │   Cookie: sid=abc        │
-  │                          ├── Lookup session "abc"
-  │◄── {user: {...}} ───────┤
-```
-
-```typescript
-import session from 'express-session';
-import RedisStore from 'connect-redis';
-import { createClient } from 'redis';
-
-const redisClient = createClient();
-await redisClient.connect();
+import session from 'express-session'
+import { RedisStore } from 'connect-redis'
 
 app.use(session({
   store: new RedisStore({ client: redisClient }),
-  name: '__Host-sid',  // Préfixe __Host- pour cookies sécurisés
-  secret: process.env.SESSION_SECRET!,
+  name: '__Host-sid',              // préfixe __Host- : impose Secure + Path=/ + pas de Domain
+  secret: process.env.SESSION_SECRET!, // clé de signature du cookie ; secret hors code
   resave: false,
-  saveUninitialized: false,
+  saveUninitialized: false,        // pas de session avant login → RGPD-friendly, moins de bruit
   cookie: {
-    httpOnly: true,    // ✅ Inaccessible au JavaScript
-    secure: true,      // ✅ HTTPS uniquement
-    sameSite: 'lax',   // ✅ Protection CSRF
-    maxAge: 3600_000,  // 1 heure
+    httpOnly: true,                // inaccessible au JS → un XSS ne peut pas lire le cookie
+    secure: true,                  // HTTPS uniquement
+    sameSite: 'lax',               // atténue le CSRF ; 'strict' pour les actions sensibles
+    maxAge: 1000 * 60 * 60,        // 1 h
     path: '/',
-    domain: '.example.com',
   },
-}));
+}))
 ```
 
-### 3.2 Authentification par token (JWT)
+**Token (stateless)** — le serveur signe un **JWT** que le client renvoie dans l'en-tête `Authorization: Bearer`. Le serveur vérifie la **signature** sans lookup. Détails et pièges JWT (algorithme `none`, algorithm confusion RS256→HS256, stockage) → **module 08 (API security)**. Le flux OAuth/OIDC qui émet ces tokens → **module 03b**.
 
-```
-Client                    Serveur
-  │                          │
-  ├── POST /login ──────────►│
-  │   {email, password}      │
-  │                          ├── Vérifie credentials
-  │                          ├── Signe un JWT
-  │◄── {accessToken: "..."} ─┤
-  │                          │
-  ├── GET /api/me ──────────►│
-  │   Authorization: Bearer ..│
-  │                          ├── Vérifie signature JWT
-  │◄── {user: {...}} ───────┤
-```
-
-### Comparaison
-
-| Critère | Sessions | JWT |
+| Critère | Session serveur | JWT (token) |
 |---|---|---|
-| Stockage serveur | Oui (Redis/BDD) | Non (stateless) |
-| Scalabilité | Nécessite store partagé | Excellente |
-| Révocation | Facile (supprimer la session) | Difficile (attendre l'expiration) |
-| Taille | Cookie petit (~32 bytes) | Token plus gros (~1KB) |
-| CSRF | Vulnérable (cookie auto) | Protégé (header manuel) |
-| XSS | Cookie HttpOnly protège | localStorage vulnérable |
+| État serveur | oui (store) | non (stateless) |
+| Révocation immédiate | facile (supprimer la session) | difficile (attendre l'expiration ou denylist) |
+| Passage à l'échelle | store partagé requis | naturel |
+| Transport par défaut | cookie (auto-envoyé → attention CSRF) | header (manuel → pas de CSRF auto) |
+| Risque de vol | cookie `HttpOnly` protège du XSS | `localStorage` exposé au XSS |
+
+**Défaut raisonnable pour une app web classique comme TribuZen : session serveur + cookie `__Host-` `HttpOnly`.** Le JWT brille surtout en microservices / API multi-clients.
+
+### 2.5 Durcir la session
+
+- **Régénérer l'ID après login** (`req.session.regenerate`) → tue la **session fixation** (l'attaquant ne peut pas pré-fixer un ID que la victime authentifiera).
+- **Double timeout** : **inactivité** (~15–30 min) *et* **absolu** (~8 h) — la session meurt même active.
+- **Régénérer aussi lors d'une élévation de privilège** (ex. entrée dans une zone admin).
+- **Invalider côté serveur au logout** (détruire la session, pas seulement supprimer le cookie).
+- **Cookie** : `HttpOnly` + `Secure` + `SameSite` + préfixe `__Host-`.
+
+### 2.6 Protection anti-brute-force et anti-énumération
+
+- **Verrouillage sur le compte** (pas sur l'IP seule, qui tourne) : seuil de tentatives, fenêtre d'observation, durée de blocage — idéalement **backoff exponentiel** (1 s, 2 s, 4 s…).
+- **Rate limiting / throttling** au niveau IP + compte, **CAPTCHA** après quelques échecs.
+- **Messages génériques en temps constant** : même réponse (« Identifiants invalides »), même code (401), même latence, que l'email existe ou non. Attention à la **différence de timing** : si un email inexistant répond instantanément et un email existant après un `argon2.verify` de 300 ms, l'attaquant énumère à la montre. Parade : hacher un **hash factice** même quand l'utilisateur n'existe pas.
+- Laisser le **« mot de passe oublié » fonctionner même pendant un verrouillage**, sinon on crée un déni de service.
+
+### 2.7 Reset password sûr
+
+Le « mot de passe oublié » est une **porte d'authentification** à part entière — souvent le maillon faible.
+
+- **Token aléatoire** (≥ 32 octets, CSPRNG), **à usage unique**, **à durée de vie courte** (~15–60 min).
+- **Ne stocker que le hash du token** en base (comme un mot de passe) : si la base fuit, les tokens ne sont pas rejouables.
+- **Message générique** : « Si cette adresse existe, un email a été envoyé » — jamais « cet email n'existe pas » (énumération).
+- **Ne jamais** envoyer le mot de passe (ni un nouveau mot de passe) par email.
+- **Invalider les sessions existantes** après un reset réussi, et notifier l'utilisateur par email du changement.
 
 ---
 
-## 4. JWT en profondeur
+## 3. Worked examples
 
-### 4.1 Structure
+### Exemple 1 — Endpoint de login durci (TribuZen)
 
-```
-eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.
-eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJyb2xlIjoiYWRtaW4iLCJpYXQiOjE2OTk5OTk5OTksImV4cCI6MTcwMDAwMzU5OX0.
-signature_ici
-
-Header (Base64)     .  Payload (Base64)    .  Signature
-{                      {
-  "alg": "RS256",       "sub": "12345",
-  "typ": "JWT"          "name": "John",
-}                       "role": "admin",
-                        "iat": 1699999999,
-                        "exp": 1700003599
-                      }
-```
-
-### 4.2 Algorithmes de signature
-
-| Algorithme | Type | Clé | Recommandation |
-|---|---|---|---|
-| HS256 | Symétrique | 1 secret partagé | ✅ Interne, simple |
-| RS256 | Asymétrique | Clé privée + publique | ✅ Multi-services |
-| ES256 | Asymétrique (ECDSA) | Clé plus petite | ✅ Performant |
-| none | Aucune | — | ❌ JAMAIS en production |
-
-### 4.3 Implémentation sécurisée
+On reprend le endpoint du §1 et on bouche les quatre trous.
 
 ```typescript
-import jwt from 'jsonwebtoken';
-import fs from 'node:fs';
+// POST /api/login — APRÈS durcissement
+import argon2 from 'argon2'
+import rateLimit from 'express-rate-limit'
 
-// RS256 avec clés asymétriques
-const PRIVATE_KEY = fs.readFileSync('./keys/private.pem');
-const PUBLIC_KEY = fs.readFileSync('./keys/public.pem');
+// Hash factice pré-calculé une fois : sert à égaliser le timing quand l'email n'existe pas.
+const DUMMY_HASH = await argon2.hash('timing-equalizer-not-a-real-password')
 
-interface TokenPayload {
-  sub: string;
-  role: string;
-}
+// Limiteur : 5 tentatives / 15 min par IP (compléter par un verrou sur le compte).
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5 })
 
-function signAccessToken(user: { id: string; role: string }): string {
-  return jwt.sign(
-    { sub: user.id, role: user.role } satisfies TokenPayload,
-    PRIVATE_KEY,
-    {
-      algorithm: 'RS256',
-      expiresIn: '15m',    // Court ! Access token = 15 minutes max
-      issuer: 'my-app',
-      audience: 'my-app-api',
-    }
-  );
-}
+app.post('/api/login', loginLimiter, async (req, res) => {
+  const { email, password } = req.body
+  const user = await db.user.findUnique({ where: { email } })
 
-function verifyAccessToken(token: string): TokenPayload {
-  return jwt.verify(token, PUBLIC_KEY, {
-    algorithms: ['RS256'],   // ✅ Spécifier EXPLICITEMENT les algos acceptés
-    issuer: 'my-app',
-    audience: 'my-app-api',
-    complete: false,
-  }) as TokenPayload;
-}
-```
+  // (2) Toujours faire un verify argon2 — même sans utilisateur — pour un timing constant.
+  //     On ne révèle jamais lequel des deux (email/mot de passe) était faux.
+  const ok = user
+    ? await argon2.verify(user.passwordHash, password)
+    : (await argon2.verify(DUMMY_HASH, password), false)
 
-### 4.4 Vulnérabilités courantes des JWT
-
-#### Algorithm "none"
-
-```typescript
-// ❌ Si le serveur ne vérifie pas l'algorithme, un attaquant peut
-// envoyer un token avec alg: "none" et une signature vide
-
-// ✅ TOUJOURS spécifier les algorithmes acceptés
-jwt.verify(token, key, { algorithms: ['RS256'] });
-// Rejette automatiquement "none" et les algorithmes non listés
-```
-
-#### Algorithm confusion (RS256 → HS256)
-
-```typescript
-// ❌ L'attaquant change l'algo de RS256 (asymétrique) à HS256 (symétrique)
-// et signe avec la CLÉ PUBLIQUE (qui est... publique)
-
-// ✅ Prévention : spécifier explicitement l'algorithme
-jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256'] }); // Seul RS256 accepté
-```
-
-#### Token dans localStorage
-
-```typescript
-// ❌ localStorage est accessible au JavaScript → XSS peut voler le token
-localStorage.setItem('token', accessToken);
-
-// ✅ Préférer un cookie HttpOnly pour le refresh token
-// et garder l'access token en mémoire (variable JS)
-let accessToken: string | null = null; // Mémoire volatile, pas localStorage
-```
-
-### 4.5 Access Token + Refresh Token
-
-```typescript
-// Durées de vie
-// Access Token  : court (15 min) — signé, vérifié sans BDD
-// Refresh Token : long (7 jours) — stocké en BDD, révocable
-
-function signRefreshToken(userId: string): string {
-  const token = crypto.randomBytes(48).toString('hex');
-  // Stocker en BDD avec l'userId, la date de création et d'expiration
-  return token;
-}
-
-// Endpoint de rafraîchissement
-app.post('/api/token/refresh', async (req, res) => {
-  const refreshToken = req.cookies.refreshToken;
-  if (!refreshToken) return res.status(401).json({ error: 'No refresh token' });
-
-  // Vérifier en BDD
-  const stored = await db.query(
-    'SELECT user_id, expires_at FROM refresh_tokens WHERE token = $1',
-    [refreshToken]
-  );
-
-  if (!stored.rows[0] || new Date(stored.rows[0].expires_at) < new Date()) {
-    return res.status(401).json({ error: 'Refresh token invalide ou expiré' });
+  if (!user || !ok) {
+    // (1) Message + code IDENTIQUES quel que soit le cas → pas d'énumération.
+    return res.status(401).json({ error: 'Identifiants invalides' })
   }
 
-  // Token rotation : supprimer l'ancien, créer un nouveau
-  await db.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
-
-  const user = await findUserById(stored.rows[0].user_id);
-  const newAccessToken = signAccessToken(user);
-  const newRefreshToken = signRefreshToken(user.id);
-
-  res.cookie('refreshToken', newRefreshToken, {
-    httpOnly: true, secure: true, sameSite: 'strict', maxAge: 7 * 86400_000,
-  });
-  res.json({ accessToken: newAccessToken });
-});
-```
-
----
-
-## 5. OAuth2 et OpenID Connect
-
-### 5.1 OAuth2 — Les 4 flows
-
-| Flow | Cas d'usage | Sécurité |
-|---|---|---|
-| **Authorization Code** | Apps web avec backend | ✅ Recommandé |
-| **Authorization Code + PKCE** | SPA, apps mobiles | ✅ Recommandé |
-| **Client Credentials** | Machine-to-machine | ✅ Sûr (pas d'utilisateur) |
-| **Implicit** | (obsolète) | ❌ Déprécié |
-
-### 5.2 Authorization Code Flow avec PKCE
-
-```typescript
-import crypto from 'node:crypto';
-
-// Étape 1 : Générer le PKCE challenge
-function generatePKCE() {
-  const verifier = crypto.randomBytes(32).toString('base64url');
-  const challenge = crypto
-    .createHash('sha256')
-    .update(verifier)
-    .digest('base64url');
-  return { verifier, challenge };
-}
-
-// Étape 2 : Rediriger l'utilisateur vers le provider
-app.get('/auth/login', (req, res) => {
-  const { verifier, challenge } = generatePKCE();
-  // Stocker le verifier en session (ou cookie sécurisé)
-  req.session.pkceVerifier = verifier;
-
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: process.env.OAUTH_CLIENT_ID!,
-    redirect_uri: 'https://myapp.com/auth/callback',
-    scope: 'openid profile email',
-    state: crypto.randomBytes(16).toString('hex'), // Anti-CSRF
-    code_challenge: challenge,
-    code_challenge_method: 'S256',
-  });
-
-  res.redirect(`https://auth.provider.com/authorize?${params}`);
-});
-
-// Étape 3 : Échanger le code contre des tokens
-app.get('/auth/callback', async (req, res) => {
-  const { code, state } = req.query;
-
-  // Vérifier le state anti-CSRF
-  // ...
-
-  const tokenResponse = await fetch('https://auth.provider.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code: String(code),
-      redirect_uri: 'https://myapp.com/auth/callback',
-      client_id: process.env.OAUTH_CLIENT_ID!,
-      code_verifier: req.session.pkceVerifier, // Preuve PKCE
-    }),
-  });
-
-  const tokens = await tokenResponse.json();
-  // tokens.access_token, tokens.id_token, tokens.refresh_token
-});
-```
-
-### 5.3 OpenID Connect (OIDC)
-
-OIDC est une **couche d'identité** au-dessus d'OAuth2. Il ajoute :
-
-- Le **ID Token** (JWT) contenant les infos de l'utilisateur
-- L'endpoint **UserInfo** pour récupérer le profil
-- La **discovery** (`.well-known/openid-configuration`)
-
-```typescript
-// Vérifier un ID Token OIDC
-import { jwtVerify, createRemoteJWKSet } from 'jose';
-
-const JWKS = createRemoteJWKSet(
-  new URL('https://auth.provider.com/.well-known/jwks.json')
-);
-
-async function verifyIdToken(idToken: string) {
-  const { payload } = await jwtVerify(idToken, JWKS, {
-    issuer: 'https://auth.provider.com',
-    audience: process.env.OAUTH_CLIENT_ID!,
-  });
-  return payload; // { sub, email, name, ... }
-}
-```
-
----
-
-## 6. Multi-Factor Authentication (MFA)
-
-### 6.1 TOTP (Time-based One-Time Password)
-
-```typescript
-import { authenticator } from 'otplib';
-import QRCode from 'qrcode';
-
-// Étape 1 : Générer un secret pour l'utilisateur
-async function enableMFA(user: User) {
-  const secret = authenticator.generateSecret();
-  // Stocker le secret (chiffré) en BDD
-  await db.query(
-    'UPDATE users SET mfa_secret = $1 WHERE id = $2',
-    [encrypt(secret), user.id]
-  );
-
-  // Générer l'URI pour l'app authenticator
-  const otpauth = authenticator.keyuri(user.email, 'MonApp', secret);
-  const qrCodeUrl = await QRCode.toDataURL(otpauth);
-  return { qrCodeUrl, secret }; // Afficher le QR code à l'utilisateur
-}
-
-// Étape 2 : Vérifier le code TOTP
-function verifyTOTP(secret: string, token: string): boolean {
-  return authenticator.verify({ token, secret });
-  // Vérifie avec une fenêtre de ±30 secondes
-}
-
-// Étape 3 : Login avec MFA
-app.post('/api/login', async (req, res) => {
-  const { email, password, totpCode } = req.body;
-
-  const user = await findUser(email);
-  if (!user || !await verifyPassword(user.passwordHash, password)) {
-    return res.status(401).json({ error: 'Identifiants invalides' });
-  }
-
+  // (3) MFA : si activé, on ne pose PAS encore la session — on exige le code TOTP (voir Exemple 2).
   if (user.mfaEnabled) {
-    if (!totpCode) {
-      return res.status(200).json({ requiresMFA: true });
-    }
-    const secret = decrypt(user.mfaSecret);
-    if (!verifyTOTP(secret, totpCode)) {
-      return res.status(401).json({ error: 'Code MFA invalide' });
-    }
+    return res.status(200).json({ mfaRequired: true, challengeId: user.id })
   }
 
-  const token = signAccessToken(user);
-  res.json({ accessToken: token });
-});
-```
-
-### 6.2 WebAuthn / Passkeys
-
-WebAuthn utilise la cryptographie asymétrique avec le matériel de l'appareil (Touch ID, Windows Hello, clés FIDO2).
-
-```typescript
-import {
-  generateRegistrationOptions,
-  verifyRegistrationResponse,
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse,
-} from '@simplewebauthn/server';
-
-const rpName = 'Mon Application';
-const rpID = 'myapp.com';
-const origin = 'https://myapp.com';
-
-// Enregistrement d'un passkey
-app.post('/api/webauthn/register-options', authenticate, async (req, res) => {
-  const options = await generateRegistrationOptions({
-    rpName,
-    rpID,
-    userID: req.user.id,
-    userName: req.user.email,
-    attestationType: 'none',
-    authenticatorSelection: {
-      residentKey: 'preferred',
-      userVerification: 'preferred',
-    },
-  });
-
-  req.session.challenge = options.challenge;
-  res.json(options);
-});
-```
-
----
-
-## 7. Gestion de sessions — Attaques et protections
-
-### 7.1 Session Fixation
-
-L'attaquant fixe un ID de session connu et attend que la victime s'authentifie avec.
-
-```typescript
-// ✅ Régénérer l'ID de session après l'authentification
-app.post('/api/login', async (req, res) => {
-  // ... vérification des credentials ...
-
-  // Régénérer la session pour éviter la fixation
+  // (4) Session serveur : régénérer l'ID (anti-fixation) puis y lier l'utilisateur.
   req.session.regenerate((err) => {
-    if (err) return res.status(500).json({ error: 'Erreur serveur' });
-    req.session.userId = user.id;
-    req.session.save(() => {
-      res.json({ message: 'Connecté' });
-    });
-  });
-});
+    if (err) return res.status(500).json({ error: 'Erreur serveur' })
+    req.session.userId = user.id
+    req.session.createdAt = Date.now()
+    req.session.save(() => res.json({ ok: true }))
+  })
+})
 ```
 
-### 7.2 Session Hijacking
+Ce qui a changé : hachage argon2id vérifié en temps constant, message/HTTP génériques, rate limiting, session régénérée dans un cookie `__Host-` `HttpOnly`, et branche MFA.
 
-Vol du cookie de session via XSS ou interception réseau.
+### Exemple 2 — Second facteur TOTP
+
+TOTP (Time-based One-Time Password, RFC 6238) : un secret partagé une fois, l'app d'authentification (Google Authenticator, Aegis…) et le serveur en dérivent le même code à 6 chiffres toutes les 30 s.
 
 ```typescript
-// ✅ Protections multiples
-app.use(session({
-  cookie: {
-    httpOnly: true,    // Pas accessible en JavaScript
-    secure: true,      // HTTPS uniquement
-    sameSite: 'strict', // Pas envoyé dans les requêtes cross-site
-  },
-}));
+import { authenticator } from 'otplib'
+import QRCode from 'qrcode'
 
-// ✅ Lier la session à l'empreinte du client
-app.use((req, res, next) => {
-  const fingerprint = `${req.headers['user-agent']}:${req.ip}`;
-  if (req.session.fingerprint && req.session.fingerprint !== fingerprint) {
-    req.session.destroy(() => {
-      res.status(401).json({ error: 'Session invalidée' });
-    });
-    return;
+// --- Activation : générer un secret, l'afficher en QR code ---
+async function enableTotp(user: { id: string; email: string }) {
+  const secret = authenticator.generateSecret()
+  // Stocker le secret CHIFFRÉ (pas en clair) — c'est une clé, pas une donnée publique.
+  await db.user.update({ where: { id: user.id }, data: { mfaSecret: encrypt(secret) } })
+
+  const otpauth = authenticator.keyuri(user.email, 'TribuZen', secret)
+  const qrDataUrl = await QRCode.toDataURL(otpauth) // affiché à l'utilisateur pour scan
+  return { qrDataUrl }
+}
+
+// --- Vérification à la connexion (après mot de passe OK, cf. Exemple 1) ---
+app.post('/api/login/totp', async (req, res) => {
+  const { challengeId, code } = req.body
+  const user = await db.user.findUnique({ where: { id: challengeId } })
+  if (!user?.mfaSecret) return res.status(401).json({ error: 'Identifiants invalides' })
+
+  const secret = decrypt(user.mfaSecret)
+  // otplib tolère une petite dérive d'horloge (fenêtre de ±1 pas par défaut).
+  if (!authenticator.verify({ token: code, secret })) {
+    return res.status(401).json({ error: 'Code invalide' }) // limiter aussi cet endpoint !
   }
-  req.session.fingerprint = fingerprint;
-  next();
-});
+
+  // Seulement MAINTENANT on ouvre la session.
+  req.session.regenerate((err) => {
+    if (err) return res.status(500).json({ error: 'Erreur serveur' })
+    req.session.userId = user.id
+    req.session.createdAt = Date.now()
+    req.session.save(() => res.json({ ok: true }))
+  })
+})
 ```
 
-### 7.3 Timeouts
+> **Codes de secours** : générer ~10 codes à usage unique (stockés hachés) à l'activation, pour ne pas verrouiller un parent qui perd son téléphone. Rate-limiter l'endpoint TOTP au même titre que le login.
 
-```typescript
-const SESSION_IDLE_TIMEOUT = 30 * 60 * 1000;    // 30 minutes d'inactivité
-const SESSION_ABSOLUTE_TIMEOUT = 8 * 3600_000;   // 8 heures max
+---
 
-app.use((req, res, next) => {
-  if (!req.session.userId) return next();
+## 4. Pièges & misconceptions
 
-  const now = Date.now();
+### PIÈGE #1 — « SHA-256 est cryptographique, donc sûr pour un mot de passe »
+Faux. SHA-256 est *rapide et sûr pour l'intégrité*, mais un hash de mot de passe doit être **lent et gourmand en mémoire**. Correct : argon2id / bcrypt / scrypt / PBKDF2. Ajouter un `salt` à SHA-256 ne suffit pas : le sel casse les rainbow tables mais pas le brute-force GPU.
 
-  // Timeout absolu — la session expire même si active
-  if (now - req.session.createdAt > SESSION_ABSOLUTE_TIMEOUT) {
-    return req.session.destroy(() => {
-      res.status(401).json({ error: 'Session expirée' });
-    });
-  }
+### PIÈGE #2 — Comparer les hash avec `===`
+`if (hash === user.passwordHash)` est vulnérable au **timing** et, avec argon2/bcrypt, tout simplement faux (le hash embarque sel + paramètres). Utiliser la fonction dédiée : `argon2.verify(...)`, `bcrypt.compare(...)` — comparaison en temps constant intégrée.
 
-  // Timeout d'inactivité
-  if (now - req.session.lastActivity > SESSION_IDLE_TIMEOUT) {
-    return req.session.destroy(() => {
-      res.status(401).json({ error: 'Session expirée par inactivité' });
-    });
-  }
+### PIÈGE #3 — Messages d'erreur trop bavards → énumération
+`404 « email inconnu »` vs `401 « mot de passe faux »` révèle quels comptes existent. Même faille au reset (« cet email n'existe pas ») et à l'inscription (« email déjà pris »). Correct : **un seul message générique**, **même code HTTP**, **même timing** (hash factice si pas d'utilisateur).
 
-  req.session.lastActivity = now;
-  next();
-});
+### PIÈGE #4 — Oublier de régénérer la session après login
+Réutiliser l'ID de session pré-login expose à la **session fixation**. Toujours `req.session.regenerate()` juste après l'authentification (et à l'élévation de privilège).
+
+### PIÈGE #5 — bcrypt et la troncature silencieuse à 72 octets
+bcrypt **ignore silencieusement** tout ce qui dépasse 72 octets : deux passphrases longues partageant les 72 premiers octets ont le même hash. Parade : pré-hacher (SHA-256 → base64) avant bcrypt, ou préférer argon2id qui n'a pas cette limite.
+
+### PIÈGE #6 — Confondre le poivre (pepper) et le sel
+Le **sel** est unique par mot de passe et stocké avec le hash (géré par la lib). Le **poivre** est un secret **global** stocké **hors base**. Mettre le poivre en base à côté du hash le rend inutile — tout fuit ensemble.
+
+### PIÈGE #7 — Forcer la rotation périodique et une composition complexe
+La politique « change ton mot de passe tous les 90 jours + 1 symbole obligatoire » est **contre-productive** (OWASP/NIST l'ont abandonnée) : elle produit des variantes prévisibles. Correct : longueur généreuse, tous caractères autorisés, blocage des mots de passe compromis, MFA.
+
+---
+
+## 5. Ancrage TribuZen
+
+L'authentification est la **porte d'entrée du back-office TribuZen**, qui manipule des données de mineurs — donc le durcissement n'est pas optionnel.
+
+Où ça vit dans `smaurier/tribuzen` (back-office NestJS) :
+
+```
+tribuzen-api/
+  src/
+    auth/
+      auth.service.ts        ← hashPassword (argon2id), verify en temps constant, DUMMY_HASH
+      auth.controller.ts     ← POST /login, /login/totp, /password/forgot, /password/reset
+      session.config.ts      ← cookie __Host-sid, HttpOnly/Secure/SameSite, régénération
+      totp.service.ts        ← enableTotp, verify (otplib), codes de secours hachés
+      password-policy.ts     ← longueur ≥ 8 (MFA) / 15 (sans), check Pwned Passwords (k-anonymity)
+    common/
+      guards/rate-limit.ts   ← throttling login + verrou compte (backoff exponentiel)
+```
+
+Points d'ancrage concrets :
+- **Parents/familles** : login email + argon2id, session `__Host-sid`, MFA proposée dès l'inscription.
+- **Reset** : token 32 octets haché en base, TTL 30 min, message générique, invalidation des sessions au succès.
+- **Anti-abus** : rate limiting sur `/login` et `/login/totp`, verrou de compte à backoff exponentiel.
+- **Autorisation** (qui voit quelle famille) → **module 04**, pas ici.
+
+---
+
+## 6. Points clés
+
+1. Un mot de passe se **hache** (argon2id 1er choix : ≥ 19 MiB / 2 / 1), jamais avec MD5/SHA seul (hash *rapides* = disqualifiés).
+2. Le **sel** (unique, avec le hash) est géré par la lib ; le **poivre** (global, hors base) est une défense en profondeur optionnelle.
+3. **Vérifier** un mot de passe via `argon2.verify` / `bcrypt.compare` (temps constant), jamais `===`.
+4. Politique moderne : longueur ≥ 8 (MFA) ou 15 (sans), tous caractères, **pas de rotation forcée**, blocage des mots de passe compromis.
+5. Session serveur + cookie `__Host-` `HttpOnly`/`Secure`/`SameSite` = défaut sain pour une app web ; **régénérer l'ID après login** (anti-fixation) + double timeout.
+6. Anti-brute-force : verrou **sur le compte** à backoff exponentiel + rate limiting + CAPTCHA ; anti-énumération : message générique, même code HTTP, **même timing**.
+7. **MFA/TOTP** = meilleure défense (~99,9 % des compromissions stoppées) ; secret chiffré, endpoint TOTP rate-limité, codes de secours hachés.
+8. Reset sûr : token aléatoire à usage unique, **haché** en base, TTL court, message générique, jamais le mot de passe par email, sessions invalidées au succès.
+
+---
+
+## 7. Seeds Anki
+
+```
+Pourquoi SHA-256 est-il disqualifié pour stocker un mot de passe ?|C'est un hash RAPIDE : un GPU teste des milliards de candidats/seconde. Un mot de passe exige un hash LENT et gourmand en mémoire (argon2id, bcrypt, scrypt, PBKDF2). Ajouter un sel ne suffit pas.
+Quels sont les paramètres minimaux OWASP 2026 pour argon2id ?|Mémoire ≥ 19 MiB, itérations (timeCost) = 2, parallélisme = 1. Ce sont des planchers : on monte tant que le login reste ~1 s.
+Différence entre sel (salt) et poivre (pepper) ?|Sel : aléatoire, UNIQUE par mot de passe, stocké AVEC le hash (géré par argon2/bcrypt), casse les rainbow tables. Poivre : secret GLOBAL stocké HORS base (env/KMS), défense en profondeur si la base fuit.
+Pourquoi ne jamais comparer deux hash de mot de passe avec === ?|=== fuit par timing et, avec argon2/bcrypt, est faux car le hash embarque sel+paramètres. Utiliser argon2.verify / bcrypt.compare (comparaison temps constant).
+Comment un endpoint de login évite-t-il l'énumération d'utilisateurs ?|Même message ("Identifiants invalides"), même code HTTP (401) et même TIMING que le compte existe ou non — d'où le hachage d'un hash factice quand l'utilisateur n'existe pas.
+Qu'est-ce que la session fixation et comment la contrer ?|L'attaquant fixe un ID de session que la victime authentifie ensuite. Parade : régénérer l'ID de session (req.session.regenerate) juste après le login et à toute élévation de privilège.
+Politique de mot de passe OWASP/NIST moderne en 4 points ?|Longueur ≥ 8 (avec MFA) ou 15 (sans) et max ≥ 64 ; tous caractères autorisés (unicode, espaces) ; PAS de rotation périodique forcée ; bloquer les mots de passe compromis (Pwned Passwords).
+Que stocke-t-on en base pour un token de reset password sûr ?|Seulement le HASH du token (pas le token en clair), token aléatoire ≥ 32 octets CSPRNG à usage unique, TTL court (~15-60 min). Message générique + invalidation des sessions au succès.
+Piège bcrypt à connaître sur la longueur d'entrée ?|bcrypt ignore silencieusement au-delà de 72 octets → deux longues passphrases identiques sur 72 octets ont le même hash. Parade : pré-hacher en SHA-256/base64 avant bcrypt, ou utiliser argon2id.
 ```
 
 ---
 
-## 8. Récapitulatif
+## Pont vers le lab
 
-### Règles essentielles
-
-1. **Hasher** les mots de passe avec argon2id ou bcrypt — jamais MD5/SHA
-2. **JWT** : spécifier les algorithmes, durée courte, rotation des refresh tokens
-3. **Cookies** : HttpOnly, Secure, SameSite=Strict
-4. **Token storage** : access token en mémoire, refresh token en cookie HttpOnly
-5. **MFA** : activer pour les fonctions sensibles (paiement, admin)
-6. **Sessions** : régénérer après login, idle + absolute timeouts
-7. **OAuth2** : utiliser Authorization Code + PKCE pour les SPA
-
----
-
-> **Prochain module** : Autorisation — contrôler ce que les utilisateurs peuvent faire.
+> Lab associé : `labs/lab-03-authentification/README.md`. Exercice **défensif** : durcir un flux de login TribuZen fragile (hachage argon2id, session régénérée, message anti-énumération en temps constant, rate limiting, second facteur TOTP). Vrai outil, pas de harnais simulé. Corrigé commenté + variante J+30.

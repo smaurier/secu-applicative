@@ -1,678 +1,344 @@
-# Module 4 — Autorisation
+---
+titre: Autorisation — contrôle d'accès, RBAC/ABAC, IDOR/BOLA, moindre privilège
+cours: 14-securite-applicative
+notions: ["authZ vs authN", "deny by default", "moindre privilège", "RBAC", "ABAC / ReBAC", "contrôle d'accès au niveau objet", "IDOR (Insecure Direct Object Reference)", "BOLA (API1:2023)", "escalade horizontale / verticale", "contrôle côté serveur (jamais client)", "centraliser la logique d'autorisation", "requêtes scellées par propriétaire"]
+outcomes:
+  - "sait distinguer authentification (401) et autorisation (403) et poser le contrôle d'accès au bon endroit"
+  - "sait choisir entre RBAC, ABAC et ReBAC selon la granularité voulue et modéliser un rôle parent/admin"
+  - "sait détecter et corriger un IDOR/BOLA en scellant la requête par le propriétaire tiré de la session"
+  - "sait appliquer deny by default, le moindre privilège et centraliser la décision d'accès côté serveur"
+  - "sait qu'un contrôle d'accès purement côté client (bouton masqué) n'est pas une protection"
+prerequis:
+  - "Introduction sécurité — modèle de menace, CIA, defense in depth (module 00)"
+  - "OWASP Top 10 2021 — A01 Broken Access Control (module 01)"
+  - "Authentification — sessions, identité de l'utilisateur (module 03)"
+  - "OIDC/PKCE et WebAuthn — l'identité prouvée en amont (modules 03b, 03c)"
+next: 05-cryptographie
+libs: []
+tribuzen: "back-office TribuZen — autorisation : un parent ne voit et ne modifie que SA famille (contrôle au niveau objet), rôles parent/admin, deny by default"
+last-reviewed: 2026-07
+---
 
-## Objectifs pédagogiques
+<!-- FLAG-REVIEW: SÉCURITÉ — à valider par Sylvain -->
 
-- Connaître les modèles d'autorisation : RBAC, ABAC, ACL
-- Implémenter RBAC et ABAC dans un contexte Node.js/NestJS
-- Comprendre et prévenir les failles de Broken Access Control
-- Mettre en place le Row-Level Security en PostgreSQL
-- Centraliser l'autorisation dans une architecture distribuée
+# Autorisation — contrôle d'accès, RBAC/ABAC, IDOR/BOLA, moindre privilège
+
+> **Outcomes — tu sauras FAIRE :** séparer authN et authZ, choisir un modèle (RBAC/ABAC/ReBAC), détecter et corriger un IDOR/BOLA en scellant la requête par le propriétaire, appliquer deny by default + moindre privilège, et poser le contrôle **côté serveur** — jamais dans le bouton masqué du front.
+> **Difficulté :** :star::star::star:
+>
+> **Angle : DÉFENSIF.** On montre les failles pour les **comprendre et les corriger** dans TON code, jamais pour attaquer un tiers.
+>
+> **Portée :** ce module répond à « **qu'as-tu le droit de faire ?** ». L'identité (« qui es-tu ? ») est déjà prouvée par les modules 03 (mot de passe/session), 03b (OIDC/PKCE) et 03c (WebAuthn/passkeys). Ici on suppose l'utilisateur **authentifié** et on décide ce qu'il peut lire/écrire. Le **Broken Access Control** est la catégorie **A01 du Top 10 2021** — la plus répandue.
+
+## 1. Cas concret d'abord
+
+Dans TribuZen, chaque parent gère les activités de **ses** enfants — des **données de mineurs**, l'enjeu le plus sensible de l'app. Un collègue a livré ce endpoint pour afficher une fiche famille. Il « marche » : le parent connecté voit bien sa famille.
+
+```typescript
+// GET /api/families/:id — AVANT durcissement. NE PAS copier en prod.
+app.get('/api/families/:id', authenticate, async (req, res) => {
+  // authenticate a déjà posé req.user (identité prouvée, module 03)
+  const family = await db.family.findUnique({
+    where: { id: req.params.id }, // (!) on fait confiance à l'ID de l'URL
+  })
+  if (!family) return res.status(404).json({ error: 'Famille introuvable' })
+  res.json(family) // renvoyée sans vérifier À QUI elle appartient
+})
+```
+
+Le parent `alice` est authentifié et ouvre `/api/families/f-alice` : correct. Mais rien ne l'empêche de changer l'URL en `/api/families/f-bob` et de lire la famille de quelqu'un d'autre — enfants, adresses, plannings compris. L'ID est un **identifiant d'objet direct** exposé, et le serveur ne vérifie **jamais** que l'objet demandé appartient à l'appelant.
+
+C'est un **IDOR** (Insecure Direct Object Reference) — au niveau API, OWASP l'appelle **BOLA** (Broken Object Level Authorization, `API1:2023`), *la* faille d'API la plus fréquente. OWASP : le serveur « s'appuie sur des paramètres comme les ID d'objet envoyés par le client pour décider quels objets accéder », sans valider les droits.
+
+**Le trou :** l'utilisateur est bien **authentifié**, mais il n'est pas **autorisé** sur *cet objet précis*. `authenticate` répond « qui es-tu ? » ; personne ne répond « as-tu le droit de voir CETTE famille ? ».
+
+À la fin du module, ce endpoint **scelle** la requête par le propriétaire tiré de la session, refuse par défaut, renvoie `404` (pas `403`, pour ne pas confirmer l'existence de l'objet), et le rôle `admin` est vérifié **côté serveur**. C'est le fil rouge du lab.
 
 ---
 
-## 1. Modèles d'autorisation
+## 2. Théorie complète, concise
 
-### Vue d'ensemble
+### 2.1 authN ≠ authZ (le cadrage qui évite la moitié des failles)
 
+- **Authentification (authN)** — « qui es-tu ? ». Modules 03/03b/03c. Échec → **401 Unauthorized**.
+- **Autorisation (authZ)** — « qu'as-tu le droit de faire ? ». Ce module. Échec → **403 Forbidden**.
+
+Être authentifié ne dit **rien** sur les droits. La faille du §1 vient précisément de croire que « connecté » = « autorisé ». Toujours enchaîner les deux : d'abord prouver l'identité, ensuite décider l'accès.
+
+> Nuance HTTP : sur un objet **dont on ne veut pas révéler l'existence** à un tiers (une famille qui n'est pas la sienne), on répond souvent **404** plutôt que 403 — un 403 confirmerait « cet objet existe, mais pas pour toi » (fuite d'information). Le 403 reste correct quand l'existence n'est pas un secret.
+
+### 2.2 Les deux dimensions à contrôler
+
+Le contrôle d'accès se décline sur deux axes — OWASP recommande d'appliquer le moindre privilège sur **les deux** :
+
+- **Function-level (vertical)** — « ce **type d'action** t'est-il permis ? ». Un parent peut-il appeler `DELETE /api/users/:id` (fonction admin) ? Failles : *escalade verticale*, *Missing Function-Level Access Control* (au niveau API : **BFLA**).
+- **Object-level (horizontal)** — « cet **objet précis** t'appartient-il ? ». Alice peut-elle lire la famille de Bob (même niveau de privilège) ? Failles : *escalade horizontale*, **IDOR / BOLA**.
+
+Les deux sont indépendants : protéger l'un ne protège pas l'autre. Un endpoint peut être réservé aux parents (function-level OK) tout en laissant un parent lire la famille d'un autre (object-level KO).
+
+### 2.3 Les principes non négociables (OWASP Authorization Cheat Sheet)
+
+Vérifiés sur `cheatsheetseries.owasp.org` (Authorization Cheat Sheet, 2026-07) :
+
+1. **Deny by default** — « l'application doit toujours prendre une décision, implicite ou explicite, de refuser ou permettre ». En pratique : on part de « refusé » et on **ajoute** des autorisations ; jamais l'inverse. Une route sans règle explicite = accès refusé, pas ouvert.
+2. **Moindre privilège** — accorder le **minimum** nécessaire, horizontalement et verticalement. Un parent n'a aucun droit sur les autres familles ; un compte de service n'a que ses tables.
+3. **Valider à chaque requête** — « la permission doit être validée à chaque requête, quelle qu'en soit la source (AJAX, serveur…) ». Pas de « vérifié au login, on fait confiance ensuite ».
+4. **Contrôle côté serveur uniquement** — « les contrôles doivent être faits côté serveur, à la gateway, ou dans une fonction serverless ». Jamais côté client.
+5. **Centraliser la logique** — utiliser des filtres/middlewares/guards à l'échelle du framework plutôt qu'un `if` recopié dans chaque handler (source d'oublis). « Centraliser la logique de gestion des échecs d'accès. »
+6. **Échouer proprement + logger** — refuser sans fuiter d'info de debug, et **journaliser les accès refusés** (détection d'attaque). Tester la logique d'autorisation (tests unitaires + intégration).
+
+### 2.4 RBAC — Role-Based Access Control
+
+Les permissions sont attribuées à des **rôles**, et l'utilisateur hérite des permissions **via** son/ses rôle(s).
+
+- **Rôle** : ensemble nommé de permissions (`parent`, `admin`, `support`).
+- **Permission** : droit d'une action sur un type de ressource (`family:read`, `activity:delete`).
+- **Hiérarchie** (optionnelle) : un rôle peut hériter d'un autre (`admin` hérite de `parent`).
+
+```typescript
+type Action = 'read' | 'create' | 'update' | 'delete'
+type Resource = 'family' | 'activity' | 'user'
+
+// deny by default : une (rôle, ressource) absente = aucune permission
+const rolePermissions: Record<string, `${Resource}:${Action}`[]> = {
+  parent: ['family:read', 'family:update', 'activity:create', 'activity:delete'],
+  admin: ['user:read', 'user:delete', 'family:read'], // + tout ce qu'on lui ajoute
+}
+
+function roleCan(role: string, resource: Resource, action: Action): boolean {
+  return rolePermissions[role]?.includes(`${resource}:${action}`) ?? false // défaut: false
+}
 ```
-  ┌──────────────────────────────────────────────┐
-  │              Qui peut faire quoi ?            │
-  └──────────────┬───────────────────────────────┘
-                 │
-    ┌────────────┼────────────┬──────────────┐
-    ▼            ▼            ▼              ▼
-  RBAC         ABAC         ACL          ReBAC
-  (Rôles)    (Attributs)  (Listes)    (Relations)
+
+RBAC répond bien au **function-level** (« un parent peut-il supprimer une activité ? »). Il ne répond **pas** au **object-level** : « `parent` peut lire *une* famille » ne dit pas *laquelle*. D'où la limite qui suit.
+
+### 2.5 ABAC / ReBAC — quand le rôle ne suffit plus
+
+OWASP note que les modèles à attributs/relations offrent une logique plus fine, souvent mieux adaptée que le rôle seul aux apps modernes.
+
+- **ABAC (Attribute-Based)** — la décision dépend d'**attributs** : sujet (rôle, service), ressource (**propriétaire**, classification), action, environnement (heure, IP). C'est ABAC qui exprime « un parent peut lire une famille **dont il est le propriétaire** » : `resource.ownerId === subject.id`.
+- **ReBAC (Relationship-Based)** — la décision dépend d'une **relation** dans un graphe (« Alice est *parent-de* Léo », « Léo est *membre-de* la famille F »). C'est le modèle de Google Zanzibar ; adapté au partage fin (co-parent invité sur une famille).
+
+Règle pratique : **RBAC pour le grossier (le type d'action), ABAC/ReBAC pour le fin (quel objet)**. TribuZen combine les deux : RBAC pour `parent` vs `admin`, ABAC (ownership) pour « SA famille ».
+
+### 2.6 Contrôle au niveau objet : IDOR / BOLA et sa parade
+
+**IDOR** (Insecure Direct Object Reference) : l'utilisateur manipule un identifiant (URL, body, param) pour atteindre un objet qui n'est pas le sien, faute de **contrôle d'accès au niveau objet**. Trois ingrédients (OWASP) : (1) un objet accessible, (2) une référence (ID/UUID), (3) **l'absence de validation d'autorisation sur cet objet**.
+
+**La parade la plus robuste : sceller la requête par le propriétaire**, tiré de la **session/token** (jamais du body). On ne charge jamais « l'objet `:id` » puis on vérifie ; on charge « l'objet `:id` **ET** appartenant à `req.user.id` » en une seule requête scellée.
+
+```typescript
+// ❌ VULNÉRABLE — IDOR : lookup non scellé, puis (au mieux) check oublié
+const family = await db.family.findUnique({ where: { id: req.params.id } })
+
+// ✅ SÛR — requête scellée par le propriétaire venu de la SESSION, pas de l'URL
+const family = await db.family.findFirst({
+  where: { id: req.params.id, ownerId: req.user.id }, // deny by default naturel
+})
+// family === null => 404 : indistinguable de "n'existe pas" => pas de fuite d'existence
 ```
+
+OWASP (IDOR Prevention Cheat Sheet) : « Vérifier la permission de l'utilisateur à **chaque** tentative d'accès » et **restreindre les lookups au jeu de données accessible** à l'utilisateur. Défense en profondeur complémentaire (**pas** une protection à elle seule) : utiliser des **UUID/valeurs aléatoires** comme clés plutôt que des entiers séquentiels devinables.
+
+**PostgreSQL Row-Level Security (RLS)** pousse ce filtrage dans la base : une `POLICY` filtre les lignes selon un contexte (`current_setting('app.current_user_id')`). C'est un excellent **filet de sécurité** en profondeur — mais il **complète** le contrôle applicatif, il ne le remplace pas (et suppose de propager le bon contexte utilisateur par requête).
+
+### 2.7 Où poser le contrôle — jamais dans le client
+
+Un contrôle côté client (masquer un bouton, cacher une route Vue, filtrer un menu) est de l'**UX**, pas de la sécurité : le navigateur est sous le contrôle de l'utilisateur, qui peut appeler l'API directement (curl, Postman, DevTools). OWASP : contrôles **server-side, à la gateway, ou en serverless** — point.
+
+Répartition typique (déférée à l'archi → cours 13 / infra → cours 12) :
+
+- **Gateway / edge** : authZ de premier niveau (rôle, appartenance à un groupe). Grossier.
+- **Service applicatif** : authZ **fine** — ownership, ABAC, règles métier. C'est ici que vit « SA famille ».
+- **Base (RLS)** : filet de dernier recours en profondeur.
+
+Le front peut **aussi** masquer le bouton admin — pour l'UX — mais l'endpoint reste protégé **indépendamment**.
 
 ---
 
-## 2. RBAC — Role-Based Access Control
+## 3. Worked examples
 
-### 2.1 Concepts
+### Exemple 1 — Corriger l'IDOR du §1 (object-level, ABAC ownership)
 
-- **Utilisateur** : entité authentifiée
-- **Rôle** : ensemble nommé de permissions (admin, editor, viewer)
-- **Permission** : droit d'effectuer une action sur une ressource
-- **Hiérarchie** : un rôle peut hériter des permissions d'un autre
+On reprend `GET /api/families/:id` et on scelle la requête.
 
 ```typescript
-// Modèle de données RBAC
-interface Role {
-  name: string;
-  permissions: Permission[];
-  inherits?: Role[];
-}
+// GET /api/families/:id — APRÈS durcissement
+app.get('/api/families/:id', authenticate, async (req, res) => {
+  // Le propriétaire vient de la SESSION (req.user), JAMAIS du body/URL.
+  // Requête scellée : id demandé ET ownerId = utilisateur courant.
+  const family = await db.family.findFirst({
+    where: { id: req.params.id, ownerId: req.user.id },
+  })
 
-interface Permission {
-  resource: string;  // 'article', 'user', 'report'
-  action: string;    // 'create', 'read', 'update', 'delete'
-}
-
-const roles: Record<string, Role> = {
-  viewer: {
-    name: 'viewer',
-    permissions: [
-      { resource: 'article', action: 'read' },
-    ],
-  },
-  editor: {
-    name: 'editor',
-    permissions: [
-      { resource: 'article', action: 'create' },
-      { resource: 'article', action: 'update' },
-    ],
-    inherits: [roles.viewer], // Hérite de viewer
-  },
-  admin: {
-    name: 'admin',
-    permissions: [
-      { resource: 'article', action: 'delete' },
-      { resource: 'user', action: 'create' },
-      { resource: 'user', action: 'read' },
-      { resource: 'user', action: 'update' },
-      { resource: 'user', action: 'delete' },
-    ],
-    inherits: [roles.editor], // Hérite de editor (et transitif: viewer)
-  },
-};
-```
-
-### 2.2 Implémentation Express avec middleware
-
-```typescript
-// Middleware RBAC pour Express
-function hasPermission(resource: string, action: string) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const userRole = req.user?.role;
-    if (!userRole) {
-      return res.status(401).json({ error: 'Non authentifié' });
-    }
-
-    if (checkRolePermission(userRole, resource, action)) {
-      return next();
-    }
-
-    return res.status(403).json({ error: 'Permission refusée' });
-  };
-}
-
-function checkRolePermission(
-  roleName: string,
-  resource: string,
-  action: string
-): boolean {
-  const role = roles[roleName];
-  if (!role) return false;
-
-  // Vérifier les permissions directes
-  const hasDirectPermission = role.permissions.some(
-    (p) => p.resource === resource && p.action === action
-  );
-  if (hasDirectPermission) return true;
-
-  // Vérifier les rôles hérités (récursivement)
-  return role.inherits?.some((parent) =>
-    checkRolePermission(parent.name, resource, action)
-  ) ?? false;
-}
-
-// Utilisation sur les routes
-app.get('/api/articles',
-  authenticate,
-  hasPermission('article', 'read'),
-  listArticles
-);
-
-app.post('/api/articles',
-  authenticate,
-  hasPermission('article', 'create'),
-  createArticle
-);
-
-app.delete('/api/articles/:id',
-  authenticate,
-  hasPermission('article', 'delete'),
-  deleteArticle
-);
-```
-
-### 2.3 Schéma de base de données RBAC
-
-```sql
--- Tables pour RBAC en PostgreSQL
-CREATE TABLE roles (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(50) UNIQUE NOT NULL,
-  parent_role_id INTEGER REFERENCES roles(id)
-);
-
-CREATE TABLE permissions (
-  id SERIAL PRIMARY KEY,
-  resource VARCHAR(100) NOT NULL,
-  action VARCHAR(50) NOT NULL,
-  UNIQUE(resource, action)
-);
-
-CREATE TABLE role_permissions (
-  role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
-  permission_id INTEGER REFERENCES permissions(id) ON DELETE CASCADE,
-  PRIMARY KEY (role_id, permission_id)
-);
-
-CREATE TABLE user_roles (
-  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
-  PRIMARY KEY (user_id, role_id)
-);
-
--- Requête récursive pour résoudre les permissions héritées
-WITH RECURSIVE role_hierarchy AS (
-  SELECT id, name, parent_role_id FROM roles WHERE name = 'editor'
-  UNION ALL
-  SELECT r.id, r.name, r.parent_role_id
-  FROM roles r
-  JOIN role_hierarchy rh ON r.id = rh.parent_role_id
-)
-SELECT DISTINCT p.resource, p.action
-FROM role_hierarchy rh
-JOIN role_permissions rp ON rh.id = rp.role_id
-JOIN permissions p ON rp.permission_id = p.id;
-```
-
----
-
-## 3. ABAC — Attribute-Based Access Control
-
-### 3.1 Concepts
-
-ABAC prend des décisions basées sur des **attributs** :
-- **Sujet** (qui) : rôle, département, ancienneté, localisation
-- **Ressource** (quoi) : propriétaire, classification, date de création
-- **Action** (comment) : read, write, delete, approve
-- **Environnement** (contexte) : heure, IP, appareil
-
-### 3.2 Comparaison RBAC vs ABAC
-
-| Critère | RBAC | ABAC |
-|---|---|---|
-| Complexité | Simple | Complexe |
-| Granularité | Par rôle | Par attribut |
-| Flexibilité | Limitée | Très élevée |
-| Maintenance | Rôles à gérer | Politiques à gérer |
-| Performance | Rapide (lookup simple) | Variable (évaluation de règles) |
-| Use case | Apps simples/moyennes | Systèmes complexes, conformité |
-
-### 3.3 Implémentation ABAC
-
-```typescript
-// Définition d'une politique ABAC
-interface ABACPolicy {
-  name: string;
-  description: string;
-  effect: 'allow' | 'deny';
-  conditions: {
-    subject?: Record<string, unknown>;
-    resource?: Record<string, unknown>;
-    action?: string[];
-    environment?: Record<string, unknown>;
-  };
-}
-
-const policies: ABACPolicy[] = [
-  {
-    name: 'author-can-edit-own-articles',
-    description: "Un auteur peut modifier ses propres articles",
-    effect: 'allow',
-    conditions: {
-      action: ['update'],
-      resource: { type: 'article' },
-      // Le subject.id doit correspondre au resource.authorId
-    },
-  },
-  {
-    name: 'no-access-outside-business-hours',
-    description: "Pas d'accès aux données sensibles hors heures ouvrées",
-    effect: 'deny',
-    conditions: {
-      resource: { classification: 'confidential' },
-      environment: { outsideBusinessHours: true },
-    },
-  },
-];
-
-// Moteur d'évaluation ABAC
-interface ABACContext {
-  subject: { id: string; role: string; department: string; [key: string]: unknown };
-  resource: { type: string; ownerId?: string; classification?: string; [key: string]: unknown };
-  action: string;
-  environment: { time: Date; ip: string; [key: string]: unknown };
-}
-
-function evaluateABAC(context: ABACContext): boolean {
-  // Deny par défaut
-  let allowed = false;
-
-  for (const policy of policies) {
-    const matches = matchesPolicy(context, policy);
-    if (matches && policy.effect === 'deny') return false;
-    if (matches && policy.effect === 'allow') allowed = true;
+  // Un admin, lui, a le droit transverse (function-level) — vérifié côté serveur.
+  if (!family && req.user.role === 'admin') {
+    const asAdmin = await db.family.findUnique({ where: { id: req.params.id } })
+    if (asAdmin) return res.json(asAdmin)
   }
 
-  return allowed;
-}
+  // Deny by default : rien trouvé pour cet utilisateur => 404 (pas 403).
+  // 404 ne confirme pas l'existence de l'objet à un tiers => pas de fuite.
+  if (!family) return res.status(404).json({ error: 'Famille introuvable' })
 
-// Middleware ABAC pour Express
-function abacMiddleware(resourceType: string, action: string) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const resource = await loadResource(resourceType, req.params.id);
-    const now = new Date();
-
-    const context: ABACContext = {
-      subject: {
-        id: req.user.id,
-        role: req.user.role,
-        department: req.user.department,
-      },
-      resource: {
-        type: resourceType,
-        ownerId: resource.authorId,
-        classification: resource.classification,
-      },
-      action,
-      environment: {
-        time: now,
-        ip: req.ip,
-        outsideBusinessHours: now.getHours() < 8 || now.getHours() > 18,
-      },
-    };
-
-    if (!evaluateABAC(context)) {
-      return res.status(403).json({ error: 'Accès refusé par la politique ABAC' });
-    }
-
-    next();
-  };
-}
+  res.json(family)
+})
 ```
 
----
+Ce qui a changé : le propriétaire est tiré de la session, la requête est scellée (impossible de lire la famille d'autrui), le droit `admin` est un contrôle **serveur** explicite, et le refus est un `404` sobre.
 
-## 4. ACL — Access Control Lists
+### Exemple 2 — Guards NestJS : function-level (RBAC) + object-level (ownership)
 
-### 4.1 Concept
-
-Une ACL associe directement des **sujets** à des **ressources** avec des **permissions** spécifiques.
+En NestJS, on **centralise** l'autorisation dans des guards réutilisables plutôt que dans chaque méthode.
 
 ```typescript
-// Modèle ACL pour un système de fichiers/documents
-interface ACLEntry {
-  resourceId: string;
-  subjectId: string;
-  subjectType: 'user' | 'group';
-  permissions: ('read' | 'write' | 'delete' | 'share')[];
-}
-
-// Table en base de données
-// ┌────────────┬───────────┬─────────────┬───────────┐
-// │ resource_id│ subject_id│ subject_type│ permission│
-// ├────────────┼───────────┼─────────────┼───────────┤
-// │ doc-123    │ user-1    │ user        │ read      │
-// │ doc-123    │ user-1    │ user        │ write     │
-// │ doc-123    │ group-dev │ group       │ read      │
-// │ doc-456    │ user-2    │ user        │ read      │
-// └────────────┴───────────┴─────────────┴───────────┘
-```
-
-### 4.2 Row-Level Security en PostgreSQL
-
-PostgreSQL dispose d'un mécanisme natif de RLS qui filtre les lignes au niveau de la base de données.
-
-```sql
--- Activer RLS sur une table
-ALTER TABLE articles ENABLE ROW LEVEL SECURITY;
-
--- Politique : les utilisateurs ne voient que leurs propres articles
-CREATE POLICY user_articles_select ON articles
-  FOR SELECT
-  USING (author_id = current_setting('app.current_user_id')::INTEGER);
-
--- Politique : les utilisateurs ne modifient que leurs articles
-CREATE POLICY user_articles_update ON articles
-  FOR UPDATE
-  USING (author_id = current_setting('app.current_user_id')::INTEGER);
-
--- Politique : les admins voient tout
-CREATE POLICY admin_articles_all ON articles
-  FOR ALL
-  USING (current_setting('app.current_user_role') = 'admin');
-
--- Politique de publication : les articles publiés sont visibles par tous
-CREATE POLICY published_articles ON articles
-  FOR SELECT
-  USING (status = 'published');
-```
-
-```typescript
-// Utilisation dans Node.js — définir le contexte utilisateur
-async function queryWithRLS<T>(
-  userId: string,
-  userRole: string,
-  query: string,
-  params: unknown[]
-): Promise<T[]> {
-  const client = await pool.connect();
-  try {
-    // Définir le contexte utilisateur pour les politiques RLS
-    await client.query("SET LOCAL app.current_user_id = $1", [userId]);
-    await client.query("SET LOCAL app.current_user_role = $1", [userRole]);
-
-    const result = await client.query(query, params);
-    return result.rows;
-  } finally {
-    client.release();
-  }
-}
-
-// Les requêtes seront automatiquement filtrées par RLS
-app.get('/api/articles', authenticate, async (req, res) => {
-  const articles = await queryWithRLS(
-    req.user.id,
-    req.user.role,
-    'SELECT * FROM articles ORDER BY created_at DESC',
-    []
-  );
-  res.json(articles);
-});
-```
-
----
-
-## 5. Broken Access Control — OWASP A01
-
-### 5.1 IDOR (Insecure Direct Object Reference)
-
-L'utilisateur manipule un identifiant pour accéder aux données d'un autre.
-
-```typescript
-// ❌ VULNÉRABLE : aucune vérification de propriété
-app.get('/api/invoices/:id', authenticate, async (req, res) => {
-  const invoice = await db.query(
-    'SELECT * FROM invoices WHERE id = $1',
-    [req.params.id]  // L'user-1 peut voir l'invoice de user-2
-  );
-  res.json(invoice.rows[0]);
-});
-
-// ✅ SÉCURISÉ : vérifier que la facture appartient à l'utilisateur
-app.get('/api/invoices/:id', authenticate, async (req, res) => {
-  const invoice = await db.query(
-    'SELECT * FROM invoices WHERE id = $1 AND user_id = $2',
-    [req.params.id, req.user.id]
-  );
-  if (!invoice.rows[0]) {
-    return res.status(404).json({ error: 'Facture non trouvée' });
-  }
-  res.json(invoice.rows[0]);
-});
-```
-
-### 5.2 Privilege Escalation
-
-#### Escalation horizontale
-
-Un utilisateur accède aux données d'un **autre utilisateur** de même niveau.
-
-```typescript
-// ❌ L'utilisateur peut changer le userId dans la requête
-app.put('/api/profile', authenticate, async (req, res) => {
-  const { userId, name, email } = req.body;
-  await updateUser(userId, { name, email }); // userId non vérifié !
-});
-
-// ✅ Utiliser exclusivement l'ID du token
-app.put('/api/profile', authenticate, async (req, res) => {
-  const { name, email } = req.body;
-  await updateUser(req.user.id, { name, email }); // ID du token authentifié
-});
-```
-
-#### Escalation verticale
-
-Un utilisateur standard accède aux fonctions **admin**.
-
-```typescript
-// ❌ Vérification uniquement côté frontend
-// Le bouton "Admin" est masqué, mais l'endpoint n'est pas protégé
-app.delete('/api/users/:id', authenticate, async (req, res) => {
-  await deleteUser(req.params.id); // Pas de vérification du rôle !
-});
-
-// ✅ Vérification côté serveur OBLIGATOIRE
-app.delete('/api/users/:id',
-  authenticate,
-  authorize('admin'),
-  async (req, res) => {
-    await deleteUser(req.params.id);
-    res.json({ message: 'Utilisateur supprimé' });
-  }
-);
-```
-
-### 5.3 Missing Function-Level Access Control
-
-```typescript
-// ❌ L'endpoint admin n'a pas de protection
-app.get('/api/admin/stats', async (req, res) => {
-  const stats = await getSystemStats();
-  res.json(stats);
-});
-
-// ❌ L'API de debug est exposée en production
-app.get('/api/debug/config', (req, res) => {
-  res.json(process.env); // Fuite de TOUS les secrets !
-});
-
-// ✅ Protection systématique + pas de routes sensibles en production
-if (process.env.NODE_ENV !== 'production') {
-  app.get('/api/debug/config', authenticate, authorize('admin'), (req, res) => {
-    res.json({ nodeEnv: process.env.NODE_ENV });
-  });
-}
-```
-
----
-
-## 6. Implémentation NestJS Guards
-
-### 6.1 Guard d'authentification
-
-```typescript
-import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
-
-@Injectable()
-export class AuthGuard implements CanActivate {
-  constructor(private jwtService: JwtService) {}
-
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest();
-    const token = request.headers.authorization?.replace('Bearer ', '');
-
-    if (!token) return false;
-
-    try {
-      const payload = await this.jwtService.verifyAsync(token);
-      request.user = payload;
-      return true;
-    } catch {
-      return false;
-    }
-  }
-}
-```
-
-### 6.2 Guard RBAC avec décorateur
-
-```typescript
-import { SetMetadata } from '@nestjs/common';
-
-// Décorateur personnalisé pour définir les rôles requis
-export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
+// rôles requis, posés par décorateur — function-level (vertical)
+import { SetMetadata } from '@nestjs/common'
+export const Roles = (...roles: string[]) => SetMetadata('roles', roles)
 
 @Injectable()
 export class RolesGuard implements CanActivate {
   constructor(private reflector: Reflector) {}
-
-  canActivate(context: ExecutionContext): boolean {
-    const requiredRoles = this.reflector.getAllAndOverride<string[]>('roles', [
-      context.getHandler(),
-      context.getClass(),
-    ]);
-
-    if (!requiredRoles) return true; // Pas de rôle requis
-
-    const { user } = context.switchToHttp().getRequest();
-    return requiredRoles.includes(user.role);
+  canActivate(ctx: ExecutionContext): boolean {
+    const required = this.reflector.getAllAndOverride<string[]>('roles', [
+      ctx.getHandler(),
+      ctx.getClass(),
+    ])
+    if (!required) return false // DENY BY DEFAULT : pas de @Roles => refusé
+    const { user } = ctx.switchToHttp().getRequest()
+    return required.includes(user.role)
   }
 }
 
-// Utilisation dans un contrôleur
-@Controller('articles')
-@UseGuards(AuthGuard, RolesGuard)
-export class ArticlesController {
-  @Get()
-  @Roles('viewer', 'editor', 'admin')
-  findAll() { /* ... */ }
+@Controller('families')
+@UseGuards(AuthGuard, RolesGuard) // authN puis authZ, dans cet ordre
+export class FamiliesController {
+  constructor(private families: FamiliesService) {}
 
-  @Post()
-  @Roles('editor', 'admin')
-  create(@Body() dto: CreateArticleDto) { /* ... */ }
+  // function-level : réservé aux parents et admins
+  @Get(':id')
+  @Roles('parent', 'admin')
+  async findOne(@Param('id') id: string, @Req() req) {
+    // object-level : la couche service scelle par propriétaire (ownership)
+    // -> le RBAC ne suffit PAS, on ajoute le contrôle d'objet ici.
+    return this.families.findOwnedOrAdmin(id, req.user)
+  }
 
-  @Delete(':id')
+  // function-level : réservé aux admins (escalade verticale bloquée)
+  @Delete('users/:id')
   @Roles('admin')
-  remove(@Param('id') id: string) { /* ... */ }
-}
-```
-
-### 6.3 CASL.js — Abilities
-
-CASL est une bibliothèque isomorphe pour la gestion de permissions.
-
-```typescript
-import { AbilityBuilder, createMongoAbility, MongoAbility } from '@casl/ability';
-
-type Actions = 'create' | 'read' | 'update' | 'delete' | 'manage';
-type Subjects = 'Article' | 'Comment' | 'User' | 'all';
-
-type AppAbility = MongoAbility<[Actions, Subjects]>;
-
-function defineAbilityFor(user: { id: string; role: string }): AppAbility {
-  const { can, cannot, build } = new AbilityBuilder<AppAbility>(createMongoAbility);
-
-  switch (user.role) {
-    case 'admin':
-      can('manage', 'all'); // Peut tout faire
-      break;
-
-    case 'editor':
-      can('read', 'Article');
-      can('create', 'Article');
-      can('update', 'Article', { authorId: user.id }); // Ses propres articles
-      can('read', 'Comment');
-      can('create', 'Comment');
-      can('delete', 'Comment', { authorId: user.id });
-      break;
-
-    case 'viewer':
-      can('read', 'Article');
-      can('read', 'Comment');
-      can('create', 'Comment');
-      break;
-
-    default:
-      // Utilisateur non reconnu → aucune permission
-      break;
+  removeUser(@Param('id') id: string) {
+    return this.families.deleteUser(id)
   }
-
-  return build();
 }
-
-// Utilisation
-const ability = defineAbilityFor({ id: 'user-123', role: 'editor' });
-
-ability.can('read', 'Article');                           // true
-ability.can('delete', 'Article');                          // false
-ability.can('update', subject('Article', { authorId: 'user-123' })); // true
-ability.can('update', subject('Article', { authorId: 'other-user' })); // false
-```
-
----
-
-## 7. API Gateway et autorisation centralisée
-
-### Architecture avec Gateway
-
-```
-Client → API Gateway → Microservice A
-                    → Microservice B
-                    → Microservice C
-
-L'API Gateway centralise :
-- Authentification (vérification du JWT)
-- Rate limiting
-- Autorisation de premier niveau (rôle)
-- Le microservice gère l'autorisation fine (ownership, ABAC)
 ```
 
 ```typescript
-// Nginx / Kong / AWS API Gateway configuration concept
-const gatewayConfig = {
-  routes: [
-    {
-      path: '/api/admin/*',
-      upstream: 'admin-service',
-      plugins: {
-        auth: { required: true },
-        acl: { allowedGroups: ['admin'] },
-        rateLimit: { requests: 100, per: 'minute' },
-      },
-    },
-    {
-      path: '/api/public/*',
-      upstream: 'public-service',
-      plugins: {
-        auth: { required: false },
-        rateLimit: { requests: 1000, per: 'minute' },
-      },
-    },
-  ],
-};
+// FamiliesService — object-level centralisé (une seule source de vérité)
+async findOwnedOrAdmin(id: string, user: { id: string; role: string }) {
+  const where =
+    user.role === 'admin'
+      ? { id } // admin : accès transverse assumé (moindre privilège quand même : lecture)
+      : { id, ownerId: user.id } // parent : scellé par propriétaire
+  const family = await this.db.family.findFirst({ where })
+  if (!family) throw new NotFoundException() // deny by default => 404
+  return family
+}
+```
+
+Les deux dimensions sont couvertes : le **guard** filtre le type d'action (RBAC), le **service** filtre l'objet (ownership), et la règle d'objet est écrite **une fois**.
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — « L'utilisateur est authentifié, donc il est autorisé »
+Faux, et c'est la faille du §1. authN (401) répond « qui es-tu ? » ; authZ (403) répond « as-tu le droit ? ». Un parent connecté n'a **aucun** droit sur la famille d'un autre. Correct : après `authenticate`, décider l'accès **sur l'objet précis**.
+
+### PIÈGE #2 — Vérifier le rôle mais pas la propriété (RBAC sans object-level)
+`@Roles('parent')` protège le *type d'action* mais laisse `parent` A lire la famille de `parent` B : c'est un **IDOR/BOLA**. RBAC ≠ contrôle d'objet. Correct : ajouter le scellement par propriétaire (`ownerId = req.user.id`) en plus du rôle.
+
+### PIÈGE #3 — Faire confiance à l'ID/owner venu du client
+`updateFamily(req.body.ownerId, ...)` ou `where: { id: req.params.id }` seul : l'attaquant fournit l'ID qu'il veut. Correct : l'identité du propriétaire vient **toujours** de la session/token (`req.user.id`), jamais du body ni de l'URL.
+
+### PIÈGE #4 — Contrôle d'accès côté client
+Masquer le bouton « Supprimer » ou cacher la route admin dans Vue n'est **pas** une protection : l'API est appelable directement (curl/Postman). Correct : le contrôle vit **côté serveur** ; le masquage front est un bonus UX, jamais la barrière.
+
+### PIÈGE #5 — Allow by default (ouvrir puis restreindre)
+Une route sans règle, un `switch(role)` sans `default`, un nouveau endpoint oublié : s'il est ouvert par défaut, chaque oubli est une faille. Correct : **deny by default** — refuser tant qu'une règle n'autorise pas explicitement (`default: return false`, guard qui refuse sans `@Roles`).
+
+### PIÈGE #6 — Répondre 403 là où 404 protégerait mieux
+Sur un objet dont l'existence est sensible, `403` confirme « cet objet existe, mais pas pour toi » → fuite exploitable pour cartographier les IDs. Correct : sur les objets privés, répondre **404** (indistinguable de « n'existe pas »). Le 403 reste OK quand l'existence n'est pas secrète (ex. zone admin connue).
+
+### PIÈGE #7 — Croire que des UUID « aléatoires » suffisent
+Remplacer `id: 42` par un UUID rend l'ID difficile à deviner, mais **ne remplace pas** le contrôle d'accès : l'UUID fuit dans les logs, les partages, le cache. OWASP le classe en défense **en profondeur**, pas en protection. Correct : sceller la requête par propriétaire ; l'UUID est un plus.
+
+### PIÈGE #8 — Copier le `if (user.role === ...)` dans chaque handler
+La logique dispersée finit par diverger (un endpoint oublié, une règle obsolète). OWASP recommande de **centraliser** (guard/middleware/policy). Correct : une source de vérité (guard RBAC + service ownership), testée unitairement.
+
+---
+
+## 5. Ancrage TribuZen
+
+L'autorisation est ce qui garantit la promesse centrale de TribuZen : **un parent ne voit et ne modifie que SA famille** — des données de mineurs, donc le contrôle d'accès n'est pas optionnel.
+
+Où ça vit dans `smaurier/tribuzen` (back-office NestJS) :
+
+```
+tribuzen-api/
+  src/
+    auth/
+      roles.guard.ts          ← RBAC function-level (parent / admin), deny by default
+      roles.decorator.ts      ← @Roles(...) posé sur les routes
+    families/
+      families.controller.ts  ← @Roles + @UseGuards, ordre authN→authZ
+      families.service.ts      ← object-level : findOwnedOrAdmin (scellé par ownerId)
+    activities/
+      activities.service.ts    ← scellé via la famille propriétaire (ReBAC : activité→famille→parent)
+    common/
+      access-denied.filter.ts  ← échec propre + log des refus (détection d'attaque)
+```
+
+Points d'ancrage concrets :
+- **Object-level (le cœur)** : toute lecture/écriture de `family`/`activity` est **scellée par `ownerId` = parent de la session**. Un IDOR sur `/families/:id` est fermé par la requête scellée.
+- **Function-level** : `parent` vs `admin` via `RolesGuard` ; suppression d'utilisateur réservée à `admin` (escalade verticale bloquée côté serveur).
+- **Co-parent (ReBAC)** : un second parent invité sur une famille est autorisé **par la relation** parent↔famille, pas par un rôle global.
+- **Filet en profondeur** : PostgreSQL RLS sur `families`/`activities` en complément (jamais à la place) du contrôle applicatif.
+- **Front Vue** : masque les actions admin pour l'UX — mais l'API refuse **indépendamment**.
+
+L'identité (« qui est ce parent ? ») vient des modules 03/03b/03c ; ce module 04 décide « quelle famille a-t-il le droit de toucher ? ».
+
+---
+
+## 6. Points clés
+
+1. **authN (401) ≠ authZ (403)** : authentifié ne veut pas dire autorisé. Enchaîner identité puis droits, à **chaque requête**.
+2. Deux dimensions indépendantes : **function-level** (type d'action, escalade verticale, BFLA) et **object-level** (objet précis, escalade horizontale, **IDOR/BOLA**). Couvrir les deux.
+3. **RBAC** pour le grossier (rôle → permissions) ; **ABAC/ReBAC** pour le fin (propriétaire/relation → *quel* objet). TribuZen combine les deux.
+4. **IDOR/BOLA** (A01 / API1:2023) = pas de contrôle au niveau objet. Parade robuste : **sceller la requête par le propriétaire tiré de la session** (`id ET ownerId = req.user.id`), pas du body.
+5. **Deny by default** + **moindre privilège** : partir de « refusé », n'ajouter que le minimum, `default: false` partout.
+6. Contrôle **côté serveur uniquement** (gateway/service/RLS) ; le masquage côté client est de l'UX, pas de la sécurité.
+7. **Centraliser** la décision (guards/middlewares/policies), **logger les refus**, **tester** l'autorisation. UUID = défense en profondeur, jamais la protection.
+8. Sur objet privé, préférer **404 à 403** pour ne pas confirmer l'existence.
+
+---
+
+## 7. Seeds Anki
+
+```
+Différence entre authentification et autorisation (codes HTTP) ?|authN = "qui es-tu ?" (échec 401), prouvée par login/OIDC/WebAuthn. authZ = "qu'as-tu le droit de faire ?" (échec 403), décide l'accès. Authentifié ne veut PAS dire autorisé.
+Qu'est-ce qu'un IDOR / BOLA et sa parade principale ?|Accès à un objet d'autrui en manipulant un identifiant (URL/body), faute de contrôle au niveau objet. A01 (2021) / API1:2023. Parade : sceller la requête par le propriétaire tiré de la SESSION (WHERE id ET ownerId = req.user.id), jamais l'ID du body.
+Function-level vs object-level access control ?|Function-level (vertical) = "ce TYPE d'action t'est-il permis ?" (escalade verticale, BFLA), géré par RBAC. Object-level (horizontal) = "cet OBJET précis t'appartient-il ?" (escalade horizontale, IDOR/BOLA), géré par ownership/ABAC. Indépendants : couvrir les deux.
+Pourquoi RBAC ne suffit-il pas à empêcher un IDOR ?|RBAC dit "un parent peut lire UNE famille", pas LAQUELLE. Il protège le type d'action, pas l'objet. Il faut ajouter un contrôle object-level : ownerId = utilisateur courant (ABAC/ReBAC).
+Que signifie "deny by default" en autorisation ?|Partir de "refusé" et n'AJOUTER que les autorisations explicites (default: return false, guard qui refuse sans @Roles). Chaque route/rôle oublié reste fermé, pas ouvert. Couplé au moindre privilège.
+Pourquoi un contrôle d'accès côté client n'est-il pas une protection ?|Le navigateur est sous le contrôle de l'utilisateur : il peut appeler l'API directement (curl/Postman/DevTools). Masquer un bouton = UX. OWASP : contrôles server-side / gateway / serverless uniquement. Le front masque en plus, l'API refuse indépendamment.
+Des UUID aléatoires suffisent-ils à corriger un IDOR ?|Non. Un UUID rend l'ID dur à deviner mais fuit (logs, partages, cache) et ne vérifie AUCUN droit. OWASP : défense en profondeur, jamais la protection. La protection = sceller la requête par propriétaire.
+Sur un objet privé, faut-il répondre 403 ou 404 à un accès non autorisé ?|Souvent 404 : un 403 confirme "cet objet existe mais pas pour toi" (fuite d'existence, cartographie d'IDs). 404 est indistinguable de "n'existe pas". Le 403 reste OK quand l'existence n'est pas secrète.
+Où placer le contrôle d'autorisation dans une architecture ?|Gateway = authZ grossière (rôle/groupe). Service applicatif = authZ fine (ownership, ABAC, métier). Base = RLS en filet de profondeur (complète, ne remplace pas). Centraliser via guards/middlewares, jamais un if recopié par handler.
 ```
 
 ---
 
-## 8. Récapitulatif
+## Pont vers le lab
 
-### Quel modèle choisir ?
-
-| Situation | Modèle recommandé |
-|---|---|
-| Application simple avec quelques rôles | RBAC |
-| Règles dépendant du propriétaire de la ressource | RBAC + ownership check |
-| Règles complexes multi-critères | ABAC |
-| Système de fichiers / documents partagés | ACL |
-| Protection au niveau BDD | PostgreSQL RLS |
-
-### Checklist d'autorisation
-
-1. **Deny by default** — refuser tout accès non explicitement autorisé
-2. **Vérification côté serveur** — ne jamais se fier au frontend
-3. **Vérifier la propriété** — toujours filtrer par user ID
-4. **Tester les cas limites** — IDOR, escalation horizontale et verticale
-5. **Logger les accès refusés** — détection d'attaques
-6. **Review régulière** — audit des rôles et permissions
-
----
-
-> **Prochain module** : Cryptographie — chiffrement, hashing et gestion des secrets.
+> Lab associé : `labs/lab-04-autorisation/README.md`. Exercice **défensif** : auditer et durcir le contrôle d'accès d'une API TribuZen — corriger un IDOR en scellant la requête par le propriétaire, ajouter le contrôle function-level (RBAC parent/admin) côté serveur, appliquer deny by default. Vrai outil, pas de harnais simulé. Corrigé commenté + variante J+30.

@@ -1,690 +1,377 @@
-# Module 5 — Cryptographie
+---
+titre: Cryptographie appliquée — hachage vs chiffrement vs encodage, symétrique/asymétrique, TLS, clés
+cours: 14-securite-applicative
+notions: ["hachage vs chiffrement vs encodage", "chiffrement symétrique AES-256-GCM", "IV/nonce unique par opération", "jamais ECB", "chiffrement asymétrique RSA-OAEP / ECC (Curve25519)", "signatures numériques", "HMAC + timingSafeEqual", "TLS 1.3 & forward secrecy", "gestion de clés (KEK/DEK, rotation)", "aléa cryptographique (CSPRNG)", "ne pas rouler sa propre crypto"]
+outcomes:
+  - "sait distinguer hachage, chiffrement et encodage et choisir le bon outil pour un besoin donné"
+  - "sait chiffrer/déchiffrer une donnée sensible en AES-256-GCM avec un IV unique par opération (Web Crypto et node:crypto)"
+  - "sait quand utiliser du symétrique (AES) vs de l'asymétrique (RSA-OAEP, ECC) et pourquoi ECC est préféré à RSA aujourd'hui"
+  - "sait vérifier un webhook via HMAC en comparaison temps constant (timingSafeEqual)"
+  - "sait organiser des clés (KEK/DEK), générer de l'aléa cryptographique et éviter les pièges (ECB, IV réutilisé, Math.random, crypto maison)"
+prerequis:
+  - "Introduction sécurité — CIA (confidentialité/intégrité/disponibilité), defense in depth (module 00)"
+  - "Authentification — hachage de MOT DE PASSE argon2id/bcrypt, sel/poivre (module 03)"
+  - "Autorisation — moindre privilège, protection des données par accès (module 04)"
+next: 06-headers-securite
+libs: []
+tribuzen: back-office TribuZen — chiffrement au repos des données sensibles de mineurs (santé, allergies, notes)
+last-reviewed: 2026-07
+---
 
-## Objectifs pédagogiques
+<!-- FLAG-REVIEW: SÉCURITÉ — à valider par Sylvain -->
 
-- Distinguer chiffrement, hashing et encodage
-- Maîtriser le hashing sécurisé et l'HMAC
-- Implémenter le chiffrement symétrique (AES-256-GCM) et asymétrique (RSA, ECDSA)
-- Comprendre TLS 1.3 et la gestion des certificats
-- Gérer les secrets de manière sécurisée
-- Utiliser le module `crypto` de Node.js en pratique
+# Cryptographie appliquée — hachage vs chiffrement vs encodage, symétrique/asymétrique, TLS, clés
+
+> **Outcomes — tu sauras FAIRE :** distinguer hachage / chiffrement / encodage, chiffrer une donnée sensible en AES-256-GCM avec un IV unique (Web Crypto et `node:crypto`), choisir entre symétrique et asymétrique, vérifier un webhook en HMAC temps constant, et organiser des clés (KEK/DEK) sans jamais rouler ta propre crypto.
+> **Difficulté :** :star::star::star::star:
+>
+> **Angle : DÉFENSIF.** On assemble des primitives éprouvées pour **protéger** des données ; on montre les pièges (ECB, IV rejoué, `Math.random`) pour les **reconnaître et les corriger** dans TON code, jamais pour casser un système tiers.
+>
+> **Portée :** ce module couvre la **crypto appliquée aux données** (chiffrer au repos, signer, vérifier). Le **hachage de MOT DE PASSE** (argon2id, sel, poivre) a été traité au **module 03** — on n'y revient que pour rappeler qu'un mot de passe se **hache**, ne se **chiffre jamais**. Les **headers TLS/HSTS** côté HTTP sont détaillés au **module 06**. La **gestion des secrets d'infra** (vaults, KMS cloud) est survolée ici et approfondie au **module 10**.
+
+## 1. Cas concret d'abord
+
+Tu reprends le back-office TribuZen. Une nouvelle fonctionnalité stocke des **informations médicales d'enfants** (allergies, traitements) pour que les animateurs d'activité les voient. Un collègue a livré ce « chiffrement » pour les protéger en base. Ça « marche » en démo : on rechiffre, on redéchiffre, le texte revient.
+
+```typescript
+// utils/crypto.ts — AVANT. NE PAS copier en prod.
+import crypto from 'node:crypto'
+
+const KEY = 'tribuzen-secret-key-2026' // (1) clé en dur dans le code
+
+export function encrypt(plaintext: string): string {
+  // (2) AES en mode ECB — pas d'IV du tout
+  const cipher = crypto.createCipheriv('aes-256-ecb', Buffer.from(KEY.padEnd(32)), null)
+  let enc = cipher.update(plaintext, 'utf8', 'base64')
+  enc += cipher.final('base64')
+  return enc // (3) aucun tag d'authentification : rien ne détecte une altération
+}
+
+export function newShareToken(): string {
+  // (4) "aléatoire" pour un lien de partage de fiche médicale
+  return Math.random().toString(36).slice(2)
+}
+```
+
+**Quatre trous que ce module va boucher :**
+
+1. **Clé en dur dans le code** — versionnée dans Git, identique sur tous les environnements, impossible à faire tourner. Une clé vit **hors du code** (variable d'env, KMS) et se **fait tourner**.
+2. **Mode ECB** — chaque bloc de 16 octets est chiffré indépendamment : deux blocs de clair identiques donnent deux blocs de chiffré **identiques**. Les motifs du clair transparaissent (l'image du « pingouin ECB » est le mème classique). ECB est **proscrit**.
+3. **Pas d'authentification** — sans tag GCM, un attaquant peut modifier le chiffré ; au déchiffrement, on obtient un clair corrompu **sans erreur**. On veut du chiffrement **authentifié** (AES-GCM).
+4. **`Math.random()`** — ce n'est **pas** un générateur cryptographique : ses sorties sont prédictibles. Un token de partage de fiche médicale doit venir d'un **CSPRNG** (`crypto.randomBytes` / `crypto.getRandomValues`).
+
+À la fin du module, ce fichier chiffre en **AES-256-GCM** avec un **IV unique par opération**, un **tag d'authentification**, une **clé hors du code**, et génère ses tokens via un **CSPRNG**. C'est le fil rouge du lab.
 
 ---
 
-## 1. Principes fondamentaux
+## 2. Théorie complète, concise
 
-### Chiffrement vs Hashing vs Encoding
+### 2.1 Hachage vs chiffrement vs encodage (le tri fondamental)
 
-| | Chiffrement | Hashing | Encoding |
+Trois transformations qu'on confond sans cesse — elles ne servent **pas** au même but.
+
+| | **Encodage** | **Hachage** | **Chiffrement** |
 |---|---|---|---|
-| **Réversible** | Oui (avec la clé) | Non (one-way) | Oui (sans clé) |
-| **But** | Confidentialité | Intégrité, vérification | Représentation de données |
-| **Clé nécessaire** | Oui | Non | Non |
-| **Exemples** | AES, RSA | SHA-256, bcrypt | Base64, UTF-8, URL encoding |
-| **Use case** | Données sensibles au repos | Mots de passe, checksums | Transport de données |
+| Réversible | Oui, **sans** clé | **Non** (sens unique) | Oui, **avec** la clé |
+| But | représenter/transporter | empreinte, intégrité | confidentialité |
+| Clé | aucune | aucune (ou clé → HMAC) | oui |
+| Exemples | Base64, hex, URL-encoding | SHA-256, SHA-3 | AES, RSA, ECC |
+
+- **Encodage** (Base64…) = **zéro sécurité**. `Buffer.from('secret').toString('base64')` est lisible par quiconque le décode. Un JWT est *encodé*, pas *chiffré* : son contenu est en clair.
+- **Hachage** = sens unique, pour vérifier l'**intégrité** (checksum d'un fichier) ou stocker un mot de passe (mais alors hash *lent* : argon2id — **module 03**). SHA-256 est parfait pour l'intégrité, **disqualifié** pour un mot de passe.
+- **Chiffrement** = confidentialité **réversible avec la clé**. C'est le cœur de ce module.
+
+> Un **mot de passe se hache** (irréversible), une **donnée métier se chiffre** (on doit la relire). Chiffrer un mot de passe est une faute : si la clé fuit, tous les mots de passe sont en clair.
+
+### 2.2 Symétrique : AES-256-GCM
+
+**Symétrique** = **une seule clé** chiffre et déchiffre. Rapide, pour les **volumes de données** (chiffrer une colonne en base, un fichier).
+
+Le standard est **AES**. Ce qui compte autant que l'algo, c'est le **mode opératoire** :
+
+- **AES-GCM** (ou CCM) — **chiffrement authentifié** (AEAD) : confidentialité **+** intégrité en une passe. Produit un **tag** qui détecte toute altération. **C'est le défaut à choisir.**
+- **AES-CBC / CTR** — chiffrement seul, **sans** authentification intégrée : il faut ajouter un HMAC (Encrypt-then-MAC). Plus de pièces = plus d'erreurs. À éviter si GCM est dispo.
+- **AES-ECB** — **proscrit** : pas d'IV, blocs indépendants, motifs du clair visibles.
+
+**Taille de clé** : AES **128 bits minimum, 256 bits idéalement** (OWASP, vérifié 2026-07). On vise **AES-256-GCM**.
+
+**IV / nonce** — vecteur d'initialisation :
+- **12 octets (96 bits)** pour GCM (recommandation NIST / Web Crypto).
+- **Unique pour CHAQUE opération** avec une clé donnée. **Réutiliser un IV avec la même clé casse GCM** (fuite du keystream, et pire, compromission de la clé d'authentification).
+- L'IV **n'est pas secret** : on le stocke **à côté** du chiffré. On le **génère au hasard** (CSPRNG) à chaque `encrypt`.
 
 ```typescript
-import crypto from 'node:crypto';
+// node:crypto — AES-256-GCM, format compact iv:ciphertext:tag
+import crypto from 'node:crypto'
 
-// ENCODING — transformation de format (pas de sécurité)
-const encoded = Buffer.from('secret').toString('base64');  // "c2VjcmV0"
-const decoded = Buffer.from(encoded, 'base64').toString();  // "secret"
+const ALGO = 'aes-256-gcm'
+const KEY = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex') // 32 octets = 64 hex, HORS du code
 
-// HASHING — empreinte irréversible
-const hash = crypto.createHash('sha256').update('data').digest('hex');
-// "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
-
-// CHIFFREMENT — transformation réversible avec clé
-// → Voir section dédiée plus bas
-```
-
-### La règle n°1 de la cryptographie
-
-> **Ne jamais inventer sa propre cryptographie.**
-
-Utiliser des algorithmes et bibliothèques éprouvés :
-- Node.js `crypto` (wrapper autour d'OpenSSL)
-- `libsodium` / `tweetnacl` pour du haut niveau
-- `jose` pour JWT et JWE
-
----
-
-## 2. Hashing
-
-### 2.1 Fonctions de hashing cryptographique
-
-```typescript
-import crypto from 'node:crypto';
-
-// SHA-256 — standard actuel
-function sha256(data: string): string {
-  return crypto.createHash('sha256').update(data).digest('hex');
+export function encrypt(plaintext: string): string {
+  const iv = crypto.randomBytes(12)                    // IV UNIQUE, 96 bits, CSPRNG
+  const cipher = crypto.createCipheriv(ALGO, KEY, iv)
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()                      // tag d'intégrité (16 octets)
+  return [iv.toString('hex'), enc.toString('hex'), tag.toString('hex')].join(':')
 }
 
-// SHA-3 (Keccak) — alternative à SHA-2
-function sha3_256(data: string): string {
-  return crypto.createHash('sha3-256').update(data).digest('hex');
-}
-
-// Hashing d'un fichier (streaming pour les gros fichiers)
-import fs from 'node:fs';
-
-async function hashFile(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('end', () => resolve(hash.digest('hex')));
-    stream.on('error', reject);
-  });
-}
-
-// Vérifier l'intégrité d'un téléchargement
-const expectedHash = 'a1b2c3d4...'; // Hash fourni par le distributeur
-const actualHash = await hashFile('./download.tar.gz');
-if (actualHash !== expectedHash) {
-  throw new Error('Le fichier a été altéré !');
+export function decrypt(payload: string): string {
+  const [ivHex, encHex, tagHex] = payload.split(':')
+  const decipher = crypto.createDecipheriv(ALGO, KEY, Buffer.from(ivHex, 'hex'))
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'))      // sans le tag, final() jette si altéré
+  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8')
 }
 ```
 
-### 2.2 Hashing de mots de passe
+### 2.3 Asymétrique : RSA et ECC
 
-Les fonctions de hashing classiques (SHA-256) sont **trop rapides** pour les mots de passe. On utilise des fonctions de hashing **lentes et coûteuses** pour résister au brute force.
+**Asymétrique** = **paire de clés** : une **publique** (partageable) et une **privée** (secrète). Ce qui est chiffré avec l'une se déchiffre avec l'autre. Lent → on ne chiffre **pas** de gros volumes avec, mais :
 
-```typescript
-// ╔══════════════════════════════════════════════════════════╗
-// ║  NE JAMAIS utiliser MD5, SHA-1 ou SHA-256               ║
-// ║  pour hasher des mots de passe                          ║
-// ╚══════════════════════════════════════════════════════════╝
+- **Chiffrement** : le monde chiffre avec ta clé publique, toi seul déchiffres (clé privée).
+- **Signature** : tu signes avec ta clé **privée**, tout le monde vérifie avec ta clé **publique** (origine + intégrité). C'est le principe de RS256/ES256 pour les JWT (**module 08**).
 
-// ✅ bcrypt — standard éprouvé
-import bcrypt from 'bcrypt';
+**Algorithmes (OWASP, vérifié 2026-07) :**
 
-const COST_FACTOR = 12;  // 2^12 itérations (~250ms)
-
-async function hashPasswordBcrypt(password: string): Promise<string> {
-  return bcrypt.hash(password, COST_FACTOR);
-}
-
-// ✅ scrypt — inclus dans Node.js nativement
-async function hashPasswordScrypt(password: string): Promise<string> {
-  const salt = crypto.randomBytes(16);
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (err, key) => {
-      if (err) reject(err);
-      resolve(`${salt.toString('hex')}:${key.toString('hex')}`);
-    });
-  });
-}
-
-// ✅ argon2id — le plus recommandé (vainqueur de PHC)
-import { hash, verify, argon2id } from 'argon2';
-
-async function hashPasswordArgon2(password: string): Promise<string> {
-  return hash(password, {
-    type: argon2id,
-    memoryCost: 65536,  // 64 MB — résiste aux attaques GPU
-    timeCost: 3,
-    parallelism: 4,
-  });
-}
-```
-
-### Comparaison des algorithmes de hashing de mots de passe
-
-| Algorithme | Résistance GPU | Mémoire | Standard |
-|---|---|---|---|
-| bcrypt | Bonne | Faible (4KB) | Très répandu |
-| scrypt | Très bonne | Configurable | Crypto (Litecoin) |
-| argon2id | Excellente | Configurable (64MB+) | PHC Winner, OWASP recommandé |
-
-### 2.3 HMAC — Hash-based Message Authentication Code
-
-HMAC combine un hash avec une **clé secrète** pour garantir à la fois l'intégrité et l'authenticité.
-
-```typescript
-import crypto from 'node:crypto';
-
-const HMAC_SECRET = process.env.HMAC_SECRET!;
-
-// Créer un HMAC
-function createHMAC(data: string): string {
-  return crypto
-    .createHmac('sha256', HMAC_SECRET)
-    .update(data)
-    .digest('hex');
-}
-
-// Vérifier un HMAC de manière timing-safe
-function verifyHMAC(data: string, expectedHmac: string): boolean {
-  const actualHmac = createHMAC(data);
-  // ✅ Comparaison en temps constant (résiste aux timing attacks)
-  return crypto.timingSafeEqual(
-    Buffer.from(actualHmac, 'hex'),
-    Buffer.from(expectedHmac, 'hex')
-  );
-}
-
-// Use case : vérifier un webhook (ex: Stripe, GitHub)
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
-  const signature = req.headers['stripe-signature'] as string;
-  const payload = req.body.toString();
-
-  const expectedSig = crypto
-    .createHmac('sha256', process.env.STRIPE_WEBHOOK_SECRET!)
-    .update(payload)
-    .digest('hex');
-
-  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
-    return res.status(403).json({ error: 'Signature invalide' });
-  }
-
-  // Traiter l'événement webhook...
-  res.json({ received: true });
-});
-```
-
----
-
-## 3. Chiffrement symétrique
-
-### 3.1 AES-256-GCM — Authenticated Encryption
-
-AES-GCM fournit à la fois **confidentialité** et **intégrité** (authenticated encryption). C'est le standard recommandé.
-
-```typescript
-import crypto from 'node:crypto';
-
-const ALGORITHM = 'aes-256-gcm';
-const KEY_LENGTH = 32;  // 256 bits
-const IV_LENGTH = 12;   // 96 bits pour GCM (recommandé NIST)
-const TAG_LENGTH = 16;  // 128 bits
-
-// La clé doit venir d'un secret sécurisé
-const ENCRYPTION_KEY = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex');
-// Générer une clé : crypto.randomBytes(32).toString('hex')
-
-interface EncryptedData {
-  iv: string;       // Initialization Vector (unique par chiffrement)
-  encrypted: string; // Données chiffrées
-  tag: string;       // Authentication tag (intégrité)
-}
-
-function encrypt(plaintext: string): EncryptedData {
-  // ✅ IV unique pour CHAQUE opération de chiffrement
-  const iv = crypto.randomBytes(IV_LENGTH);
-
-  const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv, {
-    authTagLength: TAG_LENGTH,
-  });
-
-  let encrypted = cipher.update(plaintext, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-
-  return {
-    iv: iv.toString('hex'),
-    encrypted,
-    tag: cipher.getAuthTag().toString('hex'),
-  };
-}
-
-function decrypt(data: EncryptedData): string {
-  const decipher = crypto.createDecipheriv(
-    ALGORITHM,
-    ENCRYPTION_KEY,
-    Buffer.from(data.iv, 'hex'),
-    { authTagLength: TAG_LENGTH }
-  );
-
-  decipher.setAuthTag(Buffer.from(data.tag, 'hex'));
-
-  let decrypted = decipher.update(data.encrypted, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-
-  return decrypted;
-}
-```
-
-### 3.2 Gestion des IV/Nonces
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║  RÈGLE ABSOLUE : ne JAMAIS réutiliser un IV/nonce           ║
-║  avec la même clé. Cela compromet la confidentialité.       ║
-╚══════════════════════════════════════════════════════════════╝
-
-Clé + IV → Keystream unique
-Même Clé + Même IV → Même Keystream → XOR des plaintexts = catastrophe
-```
-
-```typescript
-// ✅ Toujours générer un IV aléatoire
-const iv = crypto.randomBytes(12); // 96 bits pour GCM
-
-// ✅ Stocker l'IV avec le ciphertext (l'IV n'est pas secret)
-const stored = `${iv.toString('hex')}:${encrypted}:${tag.toString('hex')}`;
-
-// Format de stockage compact
-function encryptCompact(plaintext: string): string {
-  const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
-  let enc = cipher.update(plaintext, 'utf8', 'hex');
-  enc += cipher.final('hex');
-  const tag = cipher.getAuthTag();
-  // iv:ciphertext:tag — tout est nécessaire pour déchiffrer
-  return `${iv.toString('hex')}:${enc}:${tag.toString('hex')}`;
-}
-
-function decryptCompact(data: string): string {
-  const [ivHex, encHex, tagHex] = data.split(':');
-  const decipher = crypto.createDecipheriv(
-    ALGORITHM,
-    ENCRYPTION_KEY,
-    Buffer.from(ivHex, 'hex')
-  );
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  let dec = decipher.update(encHex, 'hex', 'utf8');
-  dec += decipher.final('utf8');
-  return dec;
-}
-```
-
----
-
-## 4. Chiffrement asymétrique
-
-### 4.1 RSA — Chiffrement et signatures
-
-```typescript
-import crypto from 'node:crypto';
-
-// Générer une paire de clés RSA
-const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
-  modulusLength: 4096,
-  publicKeyEncoding: { type: 'spki', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-});
-
-// Chiffrer avec la clé publique
-function rsaEncrypt(data: string, pubKey: string): string {
-  const encrypted = crypto.publicEncrypt(
-    {
-      key: pubKey,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: 'sha256',
-    },
-    Buffer.from(data)
-  );
-  return encrypted.toString('base64');
-}
-
-// Déchiffrer avec la clé privée
-function rsaDecrypt(encryptedData: string, privKey: string): string {
-  const decrypted = crypto.privateDecrypt(
-    {
-      key: privKey,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: 'sha256',
-    },
-    Buffer.from(encryptedData, 'base64')
-  );
-  return decrypted.toString('utf8');
-}
-```
-
-### 4.2 Signatures numériques
-
-```typescript
-// Signer un message (prouve l'origine et l'intégrité)
-function sign(data: string, privKey: string): string {
-  const signer = crypto.createSign('SHA256');
-  signer.update(data);
-  return signer.sign(privKey, 'base64');
-}
-
-// Vérifier une signature
-function verifySignature(data: string, signature: string, pubKey: string): boolean {
-  const verifier = crypto.createVerify('SHA256');
-  verifier.update(data);
-  return verifier.verify(pubKey, signature, 'base64');
-}
-
-// Use case : JWT avec RS256
-// Le serveur d'authentification SIGNE avec la clé privée
-// Les microservices VÉRIFIENT avec la clé publique
-// → La clé publique peut être partagée librement
-```
-
-### 4.3 ECDSA — Alternative moderne à RSA
-
-```typescript
-// ECDSA : clés plus petites, même niveau de sécurité
-const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
-  namedCurve: 'P-256',  // secp256r1, 128 bits de sécurité
-  publicKeyEncoding: { type: 'spki', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-});
-
-// Signer avec ECDSA
-function ecdsaSign(data: string, privKey: string): string {
-  return crypto.sign('sha256', Buffer.from(data), privKey).toString('base64');
-}
-
-// Vérifier
-function ecdsaVerify(data: string, signature: string, pubKey: string): boolean {
-  return crypto.verify(
-    'sha256',
-    Buffer.from(data),
-    pubKey,
-    Buffer.from(signature, 'base64')
-  );
-}
-```
-
-### Comparaison RSA vs ECDSA
-
-| | RSA-4096 | ECDSA P-256 |
+| | **RSA** | **ECC (courbes elliptiques)** |
 |---|---|---|
-| Taille de clé | 4096 bits | 256 bits |
-| Sécurité équivalente | ~128 bits | ~128 bits |
-| Performance signature | Lente | Rapide |
-| Performance vérification | Rapide | Moyenne |
-| Taille signature | ~512 bytes | ~64 bytes |
+| Clé minimale | **2048 bits** (3072+ recommandé) | courbe sûre : **Curve25519 / P-256** |
+| Sécurité ~128 bits | RSA-3072 | P-256 (256 bits de clé) |
+| Vitesse / taille | lent, grosses clés/signatures | rapide, petites clés/signatures |
+| Padding chiffrement | **OAEP** (jamais PKCS#1 v1.5 pour du neuf) | — |
+| Préférence 2026 | legacy / interop | **préféré** (Curve25519 : X25519 chiffrement, Ed25519 signature) |
+
+> **ECC est préféré à RSA aujourd'hui** : même sécurité pour des clés bien plus petites et des opérations plus rapides. On garde RSA surtout pour l'interopérabilité avec l'existant.
+
+```typescript
+// node:crypto — signature Ed25519 (courbe moderne, rapide)
+import crypto from 'node:crypto'
+
+const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519')
+
+const message = Buffer.from('fiche #4217 validée')
+const signature = crypto.sign(null, message, privateKey)          // signe avec la privée
+const ok = crypto.verify(null, message, publicKey, signature)     // vérifie avec la publique
+```
+
+### 2.4 HMAC et comparaison en temps constant
+
+**HMAC** = hachage **+ clé secrète** : prouve qu'un message vient de quelqu'un qui connaît la clé (intégrité **+** authenticité), sans chiffrer. Usage type : **vérifier un webhook** (Stripe, GitHub signent le payload).
+
+Deux règles :
+1. La clé du webhook est un **secret** (hors du code).
+2. On compare les signatures en **temps constant** — `crypto.timingSafeEqual`. Une comparaison naïve (`===`) s'arrête au premier octet différent : le **temps** de réponse fuit combien d'octets étaient corrects, ce qui permet de reconstituer la signature octet par octet.
+
+```typescript
+import crypto from 'node:crypto'
+
+function verifyWebhook(rawBody: Buffer, signatureHeader: string, secret: string): boolean {
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex')
+  const a = Buffer.from(signatureHeader, 'hex')
+  const b = Buffer.from(expected, 'hex')
+  // timingSafeEqual exige des longueurs égales → on vérifie d'abord, sinon il jette
+  return a.length === b.length && crypto.timingSafeEqual(a, b)
+}
+```
+
+### 2.5 TLS 1.3 : la crypto « en transit »
+
+Tout ce qui précède protège la donnée **au repos**. **TLS** la protège **en transit** (chiffrement + intégrité + authentification du serveur via son certificat). Points à retenir :
+
+- **TLS 1.3** : handshake **1-RTT** (plus rapide), algorithmes obsolètes supprimés (RC4, 3DES, SHA-1), **forward secrecy obligatoire** — la compromission de la clé privée du serveur ne déchiffre **pas** les sessions passées (chaque session dérive une clé éphémère).
+- **Minimum TLS 1.2** en prod, TLS 1.3 préféré. Pas de TLS 1.0/1.1.
+- Certificats gratuits via **Let's Encrypt / ACME**, renouvelés automatiquement.
+- Forcer HTTPS côté application via **HSTS** → détaillé au **module 06 (headers)**.
+
+En pratique, on ne code pas TLS : on le **configure** (reverse proxy, plateforme). Le rôle du dev est de ne **jamais** désactiver la vérification de certificat (`rejectUnauthorized: false` = trou béant).
+
+### 2.6 Gestion de clés : KEK/DEK, stockage, rotation
+
+Une clé de chiffrement est le point unique de défaillance. OWASP (vérifié 2026-07) recommande une hiérarchie à **deux niveaux** :
+
+- **DEK** (Data Encryption Key) — chiffre réellement les données.
+- **KEK** (Key Encryption Key) — chiffre la DEK. La KEK vit dans un **KMS/vault** ; on ne manipule que des DEK **chiffrées** (« wrapped »).
+
+Règles :
+- **Clés hors du code et hors de la base des données** qu'elles protègent (sinon une seule fuite donne tout).
+- **Rotation** : périodique, après compromission suspectée, ou après un très gros volume chiffré. Prévoir dès le départ un **identifiant de version** dans le format stocké (`v2:iv:ct:tag`) pour déchiffrer l'ancien pendant qu'on chiffre avec le nouveau.
+- **Générer de l'aléa** de clé et d'IV avec un **CSPRNG** (voir 2.7), jamais un mot de passe humain directement (passer par un KDF : scrypt/PBKDF2/HKDF).
+
+### 2.7 Aléa cryptographique (CSPRNG) et la règle d'or
+
+- **CSPRNG** = générateur pseudo-aléatoire **cryptographiquement sûr**, imprévisible même en connaissant les sorties passées.
+  - Node : `crypto.randomBytes(n)`, `crypto.randomUUID()`, `crypto.randomInt()`.
+  - Navigateur : `crypto.getRandomValues(new Uint8Array(n))`.
+- **`Math.random()` n'est PAS cryptographique** — prévisible. Jamais pour un token, un IV, un sel, une clé.
+
+> **La règle d'or : ne roule jamais ta propre crypto.** N'invente pas d'algorithme, n'assemble pas de primitives à la main si une brique éprouvée existe. Web Crypto et `node:crypto` (OpenSSL) sont audités ; ton XOR maison ne l'est pas. « Ça a l'air aléatoire » n'est pas une preuve de sécurité. Utilise une lib de haut niveau (`libsodium`, `jose` pour JWT/JWE) dès que possible.
 
 ---
 
-## 5. TLS/SSL
+## 3. Worked examples
 
-### 5.1 Handshake TLS 1.3
+### Exemple 1 — Chiffrer une fiche médicale au repos (Web Crypto, isomorphe)
 
-```
-Client                                    Serveur
-  │                                          │
-  ├── ClientHello ──────────────────────────►│
-  │   (supported ciphers, key share)         │
-  │                                          │
-  │◄── ServerHello ──────────────────────────┤
-  │   (chosen cipher, key share,             │
-  │    certificate, verify)                  │
-  │                                          │
-  ├── Finished ────────────────────────────►│
-  │                                          │
-  │◄── Finished ─────────────────────────────┤
-  │                                          │
-  │←— Application Data (chiffré) ——→│
-```
-
-TLS 1.3 par rapport à 1.2 :
-- **1-RTT** au lieu de 2-RTT (plus rapide)
-- Algorithmes obsolètes supprimés (RC4, 3DES, SHA-1)
-- **Forward secrecy** obligatoire (compromission d'une clé ne compromet pas les sessions passées)
-
-### 5.2 Configuration HTTPS en Node.js
+`crypto.subtle` (Web Crypto API) marche dans le navigateur **et** dans Node moderne — c'est l'API standard et portable. On chiffre une note médicale en AES-256-GCM.
 
 ```typescript
-import https from 'node:https';
-import fs from 'node:fs';
+// Web Crypto — AES-256-GCM. subtle est en secure context (HTTPS) ou dans Node.
+const subtle = globalThis.crypto.subtle
 
-const server = https.createServer({
-  key: fs.readFileSync('./certs/private-key.pem'),
-  cert: fs.readFileSync('./certs/certificate.pem'),
-  ca: fs.readFileSync('./certs/ca-chain.pem'),
+// Génère une clé AES-256 (à stocker/wrapper via KMS ; ici en mémoire pour l'exemple)
+async function newKey(): Promise<CryptoKey> {
+  return subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
+}
 
-  // ✅ Configuration sécurisée
-  minVersion: 'TLSv1.2',            // Minimum TLS 1.2
-  ciphers: [
-    'TLS_AES_256_GCM_SHA384',       // TLS 1.3
-    'TLS_CHACHA20_POLY1305_SHA256', // TLS 1.3
-    'TLS_AES_128_GCM_SHA256',       // TLS 1.3
-  ].join(':'),
-}, app);
+async function encrypt(key: CryptoKey, plaintext: string) {
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12)) // IV UNIQUE, CSPRNG, 96 bits
+  const data = new TextEncoder().encode(plaintext)
+  // GCM produit ciphertext ‖ tag concaténés ; l'IV se stocke à côté (non secret)
+  const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, key, data)
+  return { iv, ciphertext: new Uint8Array(ct) }
+}
 
-// ✅ Rediriger HTTP vers HTTPS
-import http from 'node:http';
+async function decrypt(key: CryptoKey, iv: Uint8Array, ciphertext: Uint8Array) {
+  // Si le ciphertext ou le tag ont été altérés, decrypt() REJETTE (intégrité garantie).
+  const plain = await subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext)
+  return new TextDecoder().decode(plain)
+}
 
-http.createServer((req, res) => {
-  res.writeHead(301, { Location: `https://${req.headers.host}${req.url}` });
-  res.end();
-}).listen(80);
+// Usage
+const key = await newKey()
+const { iv, ciphertext } = await encrypt(key, 'Allergie : arachide. EpiPen dans le sac.')
+const clair = await decrypt(key, iv, ciphertext) // → texte d'origine, ou throw si altéré
 ```
 
-### 5.3 Let's Encrypt et ACME
+Points clés : **IV neuf à chaque `encrypt`** via `getRandomValues`, IV stocké **à côté** du chiffré, et l'intégrité est **gratuite** avec GCM — un chiffré modifié fait **échouer** le `decrypt` au lieu de rendre un clair pourri.
 
-```bash
-# Installation de Certbot
-sudo apt install certbot
+### Exemple 2 — Corriger le fichier fragile du §1
 
-# Obtenir un certificat automatiquement
-sudo certbot certonly --standalone -d myapp.com
-
-# Renouvellement automatique (cron)
-0 0 1 * * certbot renew --quiet
-```
-
-### 5.4 HSTS — HTTP Strict Transport Security
+On reprend `utils/crypto.ts` du §1 et on bouche les quatre trous, version `node:crypto`.
 
 ```typescript
-// Forcer HTTPS via le header HSTS
-app.use(helmet.hsts({
-  maxAge: 31536000,        // 1 an
-  includeSubDomains: true,
-  preload: true,           // Inclusion dans la preload list des navigateurs
-}));
+// utils/crypto.ts — APRÈS
+import crypto from 'node:crypto'
+
+// (1) clé HORS du code : 32 octets en hex dans l'env (généré une fois via
+//     crypto.randomBytes(32).toString('hex')). En prod : wrapper via KMS (KEK/DEK).
+const KEY = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex')
+if (KEY.length !== 32) throw new Error('ENCRYPTION_KEY doit faire 32 octets (64 hex)')
+
+const KEY_VERSION = 'v1' // (rotation) préfixe pour déchiffrer l'ancien après changement de clé
+
+export function encrypt(plaintext: string): string {
+  const iv = crypto.randomBytes(12)                     // (2)+(4) IV UNIQUE via CSPRNG
+  const cipher = crypto.createCipheriv('aes-256-gcm', KEY, iv) // (2) GCM, plus jamais ECB
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()                       // (3) tag d'authentification
+  return [KEY_VERSION, iv.toString('hex'), enc.toString('hex'), tag.toString('hex')].join(':')
+}
+
+export function decrypt(payload: string): string {
+  const [version, ivHex, encHex, tagHex] = payload.split(':')
+  if (version !== KEY_VERSION) throw new Error(`version de clé inconnue: ${version}`)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', KEY, Buffer.from(ivHex, 'hex'))
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'))       // (3) altération → final() jette
+  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8')
+}
+
+export function newShareToken(): string {
+  return crypto.randomBytes(32).toString('base64url')   // (4) CSPRNG, pas Math.random
+}
+```
+
+Ce qui a changé : clé hors du code + versionnée pour la rotation, **AES-256-GCM** au lieu d'ECB, **IV unique** par opération, **tag d'authentification** qui fait échouer tout déchiffrement altéré, et tokens via **CSPRNG**.
+
+---
+
+## 4. Pièges & misconceptions
+
+### PIÈGE #1 — « Base64, c'est du chiffrement »
+Non. Base64 est un **encodage** réversible **sans clé** : quiconque le décode lit le contenu. Un JWT est encodé (lisible), pas chiffré. Pour cacher une donnée → **chiffrement** (AES). Pour la transporter → encodage. Ne jamais « sécuriser » en Base64.
+
+### PIÈGE #2 — Chiffrer un mot de passe au lieu de le hacher
+Un mot de passe se **hache** (argon2id, irréversible — **module 03**), il ne se **chiffre jamais** : si la clé fuit, tous les mots de passe redeviennent lisibles. Le chiffrement est pour les données qu'on doit **relire** (fiche médicale), pas pour un secret d'authentification.
+
+### PIÈGE #3 — Mode ECB (ou AES « sans mode »)
+ECB chiffre chaque bloc indépendamment → deux blocs de clair identiques donnent le même chiffré, les motifs transparaissent. **Toujours un mode authentifié : AES-GCM.** Si tu vois `aes-256-ecb` ou un `createCipheriv` sans IV, c'est un bug.
+
+### PIÈGE #4 — Réutiliser un IV/nonce avec la même clé
+En GCM, **rejouer un IV avec la même clé est catastrophique** : le keystream se répète et la clé d'authentification peut être récupérée. L'IV doit être **neuf et aléatoire (CSPRNG) à chaque chiffrement**. Il n'est pas secret → on le stocke à côté du chiffré.
+
+### PIÈGE #5 — `Math.random()` pour du sécuritaire
+`Math.random()` est prévisible : un token de reset, un IV, un sel, une clé générés ainsi sont devinables. Toujours un **CSPRNG** : `crypto.randomBytes` (Node) ou `crypto.getRandomValues` (navigateur).
+
+### PIÈGE #6 — Comparer des secrets avec `===`
+`===` s'arrête au premier octet différent → le timing révèle combien d'octets étaient corrects (timing attack). Pour comparer une signature/HMAC/token, utiliser **`crypto.timingSafeEqual`** (longueurs égales requises).
+
+### PIÈGE #7 — Rouler sa propre crypto
+XOR maison, « chiffrement » par substitution, algo inventé « parce qu'il a l'air aléatoire » : tous cassables. **N'invente rien.** Utilise `node:crypto` / Web Crypto (OpenSSL, audités), ou une lib de haut niveau (`libsodium`, `jose`). La crypto se réutilise, elle ne se réécrit pas.
+
+### PIÈGE #8 — Chiffrement seul ≠ intégrité
+AES-CBC/CTR **sans** MAC chiffre mais ne détecte **pas** l'altération : un attaquant peut modifier le chiffré, tu déchiffres un clair corrompu sans alerte. Utiliser un mode **authentifié (GCM)** ou ajouter un HMAC (Encrypt-then-MAC).
+
+---
+
+## 5. Ancrage TribuZen
+
+TribuZen stocke des **données sensibles de mineurs** (santé, allergies, traitements, notes internes). La confidentialité **au repos** n'est pas optionnelle : une fuite de base ne doit **pas** exposer ces informations en clair. C'est un enjeu RGPD (données de santé = catégorie particulière) autant que sécurité.
+
+Où ça vit dans `smaurier/tribuzen` (back-office NestJS) :
+
+```
+tribuzen-api/
+  src/
+    crypto/
+      field-crypto.service.ts   ← encrypt/decrypt AES-256-GCM, IV par opération, version de clé
+      key-provider.ts           ← charge la DEK (wrappée par KEK au KMS), rotation
+    children/
+      child-medical.entity.ts   ← champs santé chiffrés au repos (transformer NestJS/Prisma)
+    webhooks/
+      billing.controller.ts     ← vérif HMAC-SHA256 timingSafeEqual du provider de paiement
+    common/
+      random.ts                 ← tokens de partage via crypto.randomBytes (jamais Math.random)
+```
+
+Points d'ancrage concrets :
+- **Champs médicaux** : chiffrés en base via AES-256-GCM, DEK wrappée par une KEK au KMS, format `version:iv:ct:tag`.
+- **Liens de partage** de fiche (animateur) : token 32 octets **CSPRNG**, à usage unique et TTL court (cf. reset password, module 03).
+- **Webhooks paiement** : signature vérifiée en HMAC temps constant avant tout traitement.
+- **Transport** : TLS 1.3 partout ; jamais `rejectUnauthorized: false`. Les headers HSTS/CSP → **module 06**. Les secrets d'infra (KMS, vaults) → **module 10**.
+- **Mots de passe parents** : **hachés** (argon2id), pas chiffrés → **module 03**.
+
+---
+
+## 6. Points clés
+
+1. **Encodage** (Base64) = zéro sécurité ; **hachage** = intégrité/irréversible ; **chiffrement** = confidentialité réversible avec clé. Ne pas les confondre.
+2. Un **mot de passe se hache** (module 03), une **donnée métier se chiffre** ; chiffrer un mot de passe est une faute.
+3. **Symétrique = AES-256-GCM** (chiffrement authentifié) pour les volumes ; jamais **ECB**, jamais AES sans mode authentifié.
+4. **IV/nonce : 12 octets, unique par opération (CSPRNG), non secret, stocké à côté** ; le rejouer avec la même clé casse GCM.
+5. **Asymétrique** = paire publique/privée pour échange de clé et signatures ; **ECC (Curve25519/P-256) préféré à RSA** (RSA ≥ 2048 avec OAEP si utilisé).
+6. **HMAC** authentifie un message (webhook) ; comparer en **temps constant** (`timingSafeEqual`), jamais `===`.
+7. **TLS 1.3** protège en transit (forward secrecy) ; minimum TLS 1.2, ne jamais désactiver la vérif de certificat.
+8. **Clés hors du code** (KEK/DEK, KMS), **rotation** prévue dès le format (version de clé) ; aléa via **CSPRNG**, jamais `Math.random`.
+9. **Ne roule jamais ta propre crypto** : `node:crypto` / Web Crypto / `libsodium`, pas d'algo maison.
+
+---
+
+## 7. Seeds Anki
+
+```
+Différence entre encodage, hachage et chiffrement ?|Encodage (Base64) : réversible SANS clé, zéro sécurité. Hachage (SHA-256) : sens unique, intégrité. Chiffrement (AES) : réversible AVEC la clé, confidentialité.
+Pourquoi ne jamais chiffrer un mot de passe ?|Un mot de passe se HACHE (argon2id, irréversible). Le chiffrer le rend réversible : si la clé fuit, tous les mots de passe redeviennent lisibles. Le chiffrement est pour les données qu'on doit relire.
+Quel algorithme/mode symétrique choisir par défaut et lequel proscrire ?|Défaut : AES-256-GCM (chiffrement authentifié = confidentialité + intégrité). Proscrit : ECB (blocs indépendants, motifs du clair visibles).
+Règles de l'IV/nonce en AES-GCM ?|12 octets (96 bits), UNIQUE par opération, généré par CSPRNG, non secret (stocké à côté du chiffré). Le réutiliser avec la même clé casse GCM.
+RSA vs ECC : lequel préférer aujourd'hui et pourquoi ?|ECC (Curve25519/P-256) : même sécurité que RSA pour des clés bien plus petites et des opérations plus rapides. RSA gardé pour l'interop (≥ 2048 bits, padding OAEP).
+Pourquoi comparer un HMAC/token avec timingSafeEqual et pas === ?|=== s'arrête au premier octet différent : le temps de réponse fuit combien d'octets étaient corrects (timing attack). timingSafeEqual compare en temps constant.
+Pourquoi Math.random() est interdit en sécurité ?|Ce n'est pas un CSPRNG : ses sorties sont prévisibles. Pour token/IV/sel/clé, utiliser crypto.randomBytes (Node) ou crypto.getRandomValues (navigateur).
+Qu'apporte TLS 1.3 par rapport à 1.2 ?|Handshake 1-RTT (plus rapide), suppression des algos obsolètes (RC4/3DES/SHA-1) et forward secrecy obligatoire (compromettre la clé serveur ne déchiffre pas les sessions passées).
+Que signifie KEK/DEK en gestion de clés ?|DEK (Data Encryption Key) chiffre les données ; KEK (Key Encryption Key) chiffre la DEK et vit dans un KMS/vault. Clés hors du code/base, rotation prévue via une version de clé.
+La règle d'or de la crypto appliquée ?|Ne jamais rouler sa propre crypto : utiliser des primitives éprouvées et auditées (node:crypto, Web Crypto, libsodium, jose), jamais un algo maison "qui a l'air aléatoire".
 ```
 
 ---
 
-## 6. Gestion des secrets
+## Pont vers le lab
 
-### 6.1 Variables d'environnement
-
-```bash
-# .env (LOCAL UNIQUEMENT — jamais commité)
-DATABASE_URL=postgres://user:pass@host/db
-JWT_SECRET=un-secret-tres-long-et-aleatoire
-ENCRYPTION_KEY=a1b2c3d4e5f6...
-STRIPE_SECRET_KEY=sk_live_...
-```
-
-```gitignore
-# .gitignore — OBLIGATOIRE
-.env
-.env.local
-.env.production
-*.pem
-*.key
-```
-
-```typescript
-// ✅ Validation des variables d'environnement au démarrage
-import { z } from 'zod';
-
-const EnvSchema = z.object({
-  NODE_ENV: z.enum(['development', 'production', 'test']),
-  DATABASE_URL: z.string().url(),
-  JWT_SECRET: z.string().min(32),
-  ENCRYPTION_KEY: z.string().length(64), // 32 bytes en hex
-  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-});
-
-// Échoue au démarrage si une variable manque
-const env = EnvSchema.parse(process.env);
-export default env;
-```
-
-### 6.2 Vaults et gestionnaires de secrets
-
-```typescript
-// AWS Secrets Manager
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
-
-const client = new SecretsManagerClient({ region: 'eu-west-1' });
-
-async function getSecret(secretName: string): Promise<string> {
-  const command = new GetSecretValueCommand({ SecretId: secretName });
-  const response = await client.send(command);
-  if (!response.SecretString) throw new Error('Secret non trouvé');
-  return response.SecretString;
-}
-
-// Charger les secrets au démarrage
-async function loadSecrets() {
-  const dbSecret = JSON.parse(await getSecret('prod/database'));
-  const jwtSecret = await getSecret('prod/jwt-key');
-
-  return {
-    databaseUrl: `postgres://${dbSecret.username}:${dbSecret.password}@${dbSecret.host}/${dbSecret.database}`,
-    jwtSecret,
-  };
-}
-```
-
-### 6.3 Rotation de clés
-
-```typescript
-// Stratégie de rotation : supporter plusieurs versions de clés
-interface KeyVersion {
-  id: string;
-  key: Buffer;
-  createdAt: Date;
-  active: boolean;  // Seule la clé active est utilisée pour chiffrer
-}
-
-const keys: KeyVersion[] = [
-  { id: 'v2', key: Buffer.from(process.env.ENCRYPTION_KEY_V2!, 'hex'), createdAt: new Date('2025-01-01'), active: true },
-  { id: 'v1', key: Buffer.from(process.env.ENCRYPTION_KEY_V1!, 'hex'), createdAt: new Date('2024-01-01'), active: false },
-];
-
-function encryptWithVersion(plaintext: string): string {
-  const activeKey = keys.find(k => k.active)!;
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', activeKey.key, iv);
-  let enc = cipher.update(plaintext, 'utf8', 'hex');
-  enc += cipher.final('hex');
-  const tag = cipher.getAuthTag();
-  // Préfixer avec la version de clé
-  return `${activeKey.id}:${iv.toString('hex')}:${enc}:${tag.toString('hex')}`;
-}
-
-function decryptWithVersion(data: string): string {
-  const [version, ivHex, encHex, tagHex] = data.split(':');
-  const keyVersion = keys.find(k => k.id === version);
-  if (!keyVersion) throw new Error(`Clé version ${version} non trouvée`);
-
-  const decipher = crypto.createDecipheriv(
-    'aes-256-gcm',
-    keyVersion.key,
-    Buffer.from(ivHex, 'hex')
-  );
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  let dec = decipher.update(encHex, 'hex', 'utf8');
-  dec += decipher.final('utf8');
-  return dec;
-}
-
-// Migration : re-chiffrer les données avec la nouvelle clé
-async function rotateEncryptedData() {
-  const rows = await db.query("SELECT id, encrypted_data FROM sensitive_data");
-  for (const row of rows) {
-    const decrypted = decryptWithVersion(row.encrypted_data);
-    const reEncrypted = encryptWithVersion(decrypted); // Utilise la clé active (v2)
-    await db.query(
-      'UPDATE sensitive_data SET encrypted_data = $1 WHERE id = $2',
-      [reEncrypted, row.id]
-    );
-  }
-}
-```
-
----
-
-## 7. Exemples pratiques avec Node.js `crypto`
-
-### 7.1 Générer des valeurs aléatoires sécurisées
-
-```typescript
-import crypto from 'node:crypto';
-
-// Token aléatoire (pour reset password, invitations, etc.)
-const token = crypto.randomBytes(32).toString('hex'); // 64 chars hex
-
-// UUID v4 cryptographiquement sûr
-const uuid = crypto.randomUUID();
-
-// Nombre aléatoire sécurisé dans un intervalle
-function secureRandomInt(min: number, max: number): number {
-  const range = max - min;
-  const bytesNeeded = Math.ceil(Math.log2(range) / 8);
-  let randomValue: number;
-  do {
-    randomValue = parseInt(crypto.randomBytes(bytesNeeded).toString('hex'), 16);
-  } while (randomValue >= range);
-  return min + randomValue;
-}
-```
-
-### 7.2 Dérivation de clé (KDF)
-
-```typescript
-// Dériver une clé de chiffrement à partir d'un mot de passe
-function deriveKey(password: string, salt: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, 32, { N: 16384, r: 8, p: 1 }, (err, key) => {
-      if (err) reject(err);
-      resolve(key);
-    });
-  });
-}
-
-// HKDF (HMAC-based Key Derivation Function)
-function hkdfDerive(
-  inputKey: Buffer,
-  salt: Buffer,
-  info: string,
-  length: number
-): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    crypto.hkdf('sha256', inputKey, salt, info, length, (err, key) => {
-      if (err) reject(err);
-      resolve(Buffer.from(key));
-    });
-  });
-}
-```
-
-### 7.3 Résumé : quel outil pour quel besoin
-
-| Besoin | Solution |
-|---|---|
-| Hasher un mot de passe | argon2id (ou bcrypt) |
-| Vérifier l'intégrité d'un fichier | SHA-256 |
-| Authentifier un message (webhook) | HMAC-SHA256 |
-| Chiffrer des données au repos | AES-256-GCM |
-| Signer un JWT | RS256 ou ES256 |
-| Communiquer de manière sécurisée | TLS 1.3 |
-| Générer un token aléatoire | `crypto.randomBytes()` |
-| Stocker un secret | Vault / env vars (pas le code) |
-
----
-
-## 8. Récapitulatif
-
-### Règles fondamentales
-
-1. **Ne pas inventer** — utiliser des algorithmes standards et des bibliothèques auditées
-2. **Ne jamais réutiliser** un IV/nonce avec la même clé
-3. **Comparer en temps constant** — `crypto.timingSafeEqual()` pour les secrets
-4. **Stocker les secrets hors du code** — env vars, vaults, jamais dans Git
-5. **Rotation des clés** — planifier et supporter plusieurs versions
-6. **TLS partout** — pas d'exception, même en interne
-7. **Authenticated encryption** — AES-GCM plutôt que AES-CBC seul
-
-### Ressources
-
-- [Node.js Crypto Documentation](https://nodejs.org/api/crypto.html)
-- [OWASP Cryptographic Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures/)
-- [Latacora — Cryptographic Right Answers](https://latacora.micro.blog/2018/04/03/cryptographic-right-answers.html)
-
----
-
-> Ce module conclut la série sur les fondamentaux de la sécurité applicative. Continuez à pratiquer avec les labs et exercices pour solidifier vos connaissances.
+> Lab associé : `labs/lab-05-cryptographie/README.md`. Exercice **défensif** : corriger un module de chiffrement TribuZen fragile (clé en dur + ECB + pas de tag + `Math.random`) pour le porter en AES-256-GCM avec IV unique, tag d'authentification, clé hors du code et tokens CSPRNG — en `node:crypto` puis en Web Crypto. Vrai outil, pas de harnais simulé. Corrigé commenté + variante J+30.
