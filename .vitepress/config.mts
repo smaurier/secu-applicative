@@ -14,13 +14,9 @@ export default defineConfig({
   },
 
   // Docs statiques : neutralise l'interpolation Vue `{{ }}` en prose (SSR).
-  vue: {
-    template: {
-      compilerOptions: {
-        delimiters: ['(%(', ')%)']
-      }
-    }
-  },
+  // NB : override `delimiters` retiré (il cassait le {{ }} du thème par défaut).
+  // cf docs/curriculum/DETTE-vitepress-delimiters.md
+
 
   ignoreDeadLinks: true,
 
