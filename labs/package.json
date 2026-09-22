@@ -10,7 +10,9 @@
     "lab:02": "vitest run --root lab-02-audit-owasp",
     "solution:02": "vitest run --root lab-02-audit-owasp --config vitest.solution.config.ts",
     "lab:03": "vitest run --root lab-03-csp-sur-un-front-existant",
-    "solution:03": "vitest run --root lab-03-csp-sur-un-front-existant --config vitest.solution.config.ts"
+    "solution:03": "vitest run --root lab-03-csp-sur-un-front-existant --config vitest.solution.config.ts",
+    "lab:04": "vitest run --root lab-04-relire-une-pr-auth",
+    "solution:04": "vitest run --root lab-04-relire-une-pr-auth --config vitest.solution.config.ts"
   },
   "engines": {
     "node": ">=20.0.0"
