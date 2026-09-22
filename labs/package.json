@@ -1,0 +1,20 @@
+{
+  "name": "securite-applicative-labs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Oracles exécutables des labs Sécurité applicative (règle : un lab = un geste métier complet). Les propriétés de sécurité sont prouvées par des attaques réelles simulées, pas affirmées.",
+  "type": "module",
+  "scripts": {
+    "lab:01": "vitest run --root lab-01-oidc-pkce-webauthn-de-zero",
+    "solution:01": "vitest run --root lab-01-oidc-pkce-webauthn-de-zero --config vitest.solution.config.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "5.0.1"
+  }
+}
