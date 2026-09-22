@@ -6,6 +6,20 @@
 
 > Protéger les applications web modernes : OWASP Top 10, authentification, cryptographie, sécurité des APIs et de la supply chain.
 
+<!-- labs-gestes:start -->
+## Labs — refonte du 22/09/2026 : un lab = un geste métier complet
+
+> Règle qualité 5 du parcours : chaque lab est **un geste métier complet**, sous deux formes — **Zéro** (construire de zéro un artefact réel et entier) ou **Intervention** (modifier de l'existant avec consommateurs, findings avant code, non-régression). Un lab n'entre en file qu'avec un **oracle exécutable** (`src/` starter · `test/` · `solution/` séparée). Les labs historiques de ce cours (un concept par lab, sans oracle) restent dans `labs/` jusqu'à remplacement et **ne sont plus la file**. Cible détaillée : [`docs/gestes-complets.md`](../docs/gestes-complets.md). État : **0/4 avec oracle**.
+
+| # | Lab | Forme | Geste | Oracle |
+|---|-----|-------|-------|--------|
+| 01 | `lab-01-oidc-pkce-webauthn-de-zero` | Zéro | flux d'auth complet API + front, testé | · à écrire |
+| 02 | `lab-02-audit-owasp` | Intervention | auditer une appli, corriger le top 3 trouvé | · à écrire |
+| 03 | `lab-03-csp-sur-un-front-existant` | Intervention | sans rien casser | · à écrire |
+| 04 | `lab-04-relire-une-pr-auth` | Intervention | findings avant vérité | · à écrire |
+
+<!-- labs-gestes:end -->
+
 ## Objectifs pédagogiques
 
 À l'issue de ce module, l'apprenant sera capable de :
