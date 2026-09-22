@@ -8,7 +8,9 @@
     "lab:01": "vitest run --root lab-01-oidc-pkce-webauthn-de-zero",
     "solution:01": "vitest run --root lab-01-oidc-pkce-webauthn-de-zero --config vitest.solution.config.ts",
     "lab:02": "vitest run --root lab-02-audit-owasp",
-    "solution:02": "vitest run --root lab-02-audit-owasp --config vitest.solution.config.ts"
+    "solution:02": "vitest run --root lab-02-audit-owasp --config vitest.solution.config.ts",
+    "lab:03": "vitest run --root lab-03-csp-sur-un-front-existant",
+    "solution:03": "vitest run --root lab-03-csp-sur-un-front-existant --config vitest.solution.config.ts"
   },
   "engines": {
     "node": ">=20.0.0"
